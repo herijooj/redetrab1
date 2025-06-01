@@ -195,6 +195,15 @@ class GameState:
                 return player_id
         return None
 
+    def get_pass_direction_name(self, direction_code=None):
+        """Get readable name for pass direction code."""
+        if direction_code is None:
+            direction_code = self.pass_direction
+        direction_names = ["Left", "Right", "Across", "No Pass"]
+        if 0 <= direction_code < len(direction_names):
+            return direction_names[direction_code]
+        return "Unknown"
+
     def update_pass_direction(self):
         """Update pass direction for next hand."""
         self.pass_direction = (self.pass_direction + 1) % 4
