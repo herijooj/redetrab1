@@ -12,6 +12,7 @@ class NetworkNode:
         self.message_queue = message_queue # A queue.Queue to pass received messages to the main logic
         
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(1.0)  # Set a 1-second timeout for recvfrom
         self.sock.bind(self.my_address)
         
         self.running = True
@@ -31,12 +32,13 @@ class NetworkNode:
                 
                 if header:
                     # print(f"Node {self.my_id} parsed message: {header}")
-                    # If message is for this node or broadcast, put in queue
-                    if header["dest_id"] == self.my_id or header["dest_id"] == 0xFF:
-                        self.message_queue.put((header, payload, addr))
                     
-                    # Special case: M0 also gets all PASS_CARDS messages for tracking
-                    elif self.my_id == 0 and header["type"] == 0x05:  # PASS_CARDS
+                    # Special case: M0 (dealer) monitors all PASS_CARDS messages for synchronization
+                    should_process = (header["dest_id"] == self.my_id or 
+                                    header["dest_id"] == 0xFF or
+                                    (self.my_id == 0 and header["type"] == 0x05))  # 0x05 = PASS_CARDS
+                    
+                    if should_process:
                         self.message_queue.put((header, payload, addr))
                     
                     # If message is not from this node originally, forward it
@@ -66,10 +68,9 @@ class NetworkNode:
 
     def stop(self):
         self.running = False
-        # Optional: send a dummy message to self to unblock recvfrom if needed
-        # self.sock.sendto(b'', self.my_address)
+        # No need for the dummy message to self if socket has a timeout
         if self.listen_thread.is_alive():
-            self.listen_thread.join(timeout=1)
+            self.listen_thread.join(timeout=2) # Increased timeout slightly for join
         self.sock.close()
         print(f"Node {self.my_id} stopped.")
 

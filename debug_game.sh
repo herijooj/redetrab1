@@ -9,25 +9,25 @@ pkill -f "python main.py" 2>/dev/null
 
 # Start all 4 players in auto mode with debug logging
 echo "Starting Player 3..."
-python main.py 3 --auto --debug --fast &
+python main.py 3  &
 P3_PID=$!
 
 sleep 0.5
 
 echo "Starting Player 2..."
-python main.py 2 --auto --debug --fast &
+python main.py 2  &
 P2_PID=$!
 
 sleep 0.5
 
 echo "Starting Player 1..."
-python main.py 1 --auto --debug --fast &
+python main.py 1  &
 P1_PID=$!
 
 sleep 0.5
 
 echo "Starting Player 0 (Coordinator)..."
-python main.py 0 --auto --debug --fast &
+python main.py 0  &
 P0_PID=$!
 
 echo ""
