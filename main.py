@@ -104,7 +104,7 @@ class HeartsGame:
         next_node_port = PORTS[next_player_id]
         
         self.network_node = NetworkNode(
-            self.player_id, my_port, next_node_ip, next_node_port, self.message_queue
+            self.player_id, my_port, next_node_ip, next_node_port, self.message_queue, self.verbose_mode # Pass verbose_mode
         )
         self.network_node.start()
         self.output_message(f"[DEBUG] Network started on port {my_port}", level="DEBUG")
@@ -228,7 +228,7 @@ class HeartsGame:
             if len(self.hand) < 3: # Check if player has enough cards
                 # This print remains direct as it's part of immediate input feedback loop.
                 # It's a player-facing error specific to their action.
-                print(log_with_timestamp(self.player_id, "[PLAYER] Not enough cards to pass."))
+                self.output_message("[PLAYER] Not enough cards to pass.", level="INFO")
                 self.cards_to_pass = [] # Ensure list is empty if no cards can be passed
                 self.pass_selected_cards() # Proceed, will do nothing if PASS_NONE or if cards_to_pass is not 3
                 return
@@ -238,36 +238,53 @@ class HeartsGame:
             # Loop to get valid card selection from user
             while True:
                 try:
-                    # Direct input for interactive prompt
-                    raw_input_str = input(log_with_timestamp(self.player_id, "Select 3 cards to pass (e.g., 0 1 2): "))
-                    selected_indices_str = raw_input_str.split() # Split input into list of strings
+                    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    prompt_message = "Select 3 cards to pass (e.g., 0 1 2): "
+                    input_prompt = f"[{ts}] Player {self.player_id}: {prompt_message}"
+                    raw_input_str = input(input_prompt)
 
-                    # Validate that exactly 3 cards are selected
+                    selected_indices_str = raw_input_str.strip().split()
                     if len(selected_indices_str) != 3:
-                        raise ValueError("Please select exactly 3 cards.")
-
+                        self.output_message(
+                            "[PLAYER] Invalid input. Must select exactly 3 cards. Please enter 3 distinct numbers separated by spaces.", 
+                            level="INFO"
+                        )
+                        continue
+                    
                     selected_indices = []
-                    for s_idx in selected_indices_str:
-                        idx = int(s_idx) # Convert string index to integer
-                        # Validate that index is within the bounds of the hand
+                    valid_selection = True
+                    for idx_str in selected_indices_str:
+                        if not idx_str.isdigit():
+                            self.output_message(f"[PLAYER] Invalid card index: '{idx_str}'. Indices must be numbers.", level="INFO")
+                            valid_selection = False
+                            break
+                        idx = int(idx_str)
                         if not (0 <= idx < len(self.hand)):
-                            raise ValueError(f"Index {idx} is out of range. Max index is {len(self.hand) - 1}.")
+                            self.output_message(f"[PLAYER] Invalid card index: {idx}. Please choose from 0 to {len(self.hand) - 1}.", level="INFO")
+                            valid_selection = False
+                            break
                         selected_indices.append(idx)
-
-                    # Validate that 3 distinct card indices are chosen
+                    
+                    if not valid_selection:
+                        continue
+                        
                     if len(set(selected_indices)) != 3:
-                        raise ValueError("Please select 3 distinct cards.")
-
-                    # All checks passed: store the actual card bytes based on selected indices
+                        self.output_message("[PLAYER] Please select 3 *distinct* cards.", level="INFO")
+                        continue
+                        
                     self.cards_to_pass = [self.hand[i] for i in selected_indices]
-                    break # Exit loop once valid input is received
-                except ValueError as e:
-                    # Direct print for immediate feedback to input, as it's part of a blocking loop
-                    print(log_with_timestamp(self.player_id, f"[PLAYER] Invalid input: {e} Please try again."))
-                except Exception as e:
-                     # Direct print for immediate feedback to input
-                    print(log_with_timestamp(self.player_id, f"[PLAYER] An unexpected error occurred: {e}. Please try again."))
+                    # self.output_message(f"Selected card indices for passing: {selected_indices}", level="DEBUG")
+                    break # Exit loop if selection is valid
 
+                except ValueError:
+                    self.output_message("[PLAYER] Invalid input. Please enter numbers for card indices.", level="INFO")
+                except EOFError:
+                    self.output_message("[PLAYER] Input aborted. Exiting card selection.", level="INFO")
+                    self.cards_to_pass = [] # Ensure no cards are passed
+                    return # Exit from card selection
+                except Exception as e:
+                    self.output_message(f"[PLAYER] An unexpected error occurred during input: {e}. Please try again.", level="INFO")
+            
             self.pass_selected_cards() # Proceed to pass the selected cards
         else:
             # This part of the function was originally for M0 only.
@@ -441,7 +458,10 @@ class HeartsGame:
                     while True:
                         try:
                             # Direct input for interactive prompt
-                            raw_input_str = input(log_with_timestamp(self.player_id, "Select 3 cards to pass (e.g., 0 1 2): "))
+                            ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                            prompt_message = "Select 3 cards to pass (e.g., 0 1 2): "
+                            input_prompt = f"[{ts}] Player {self.player_id}: {prompt_message}"
+                            raw_input_str = input(input_prompt)
                             selected_indices_str = raw_input_str.split() # Split input string into list
 
                             # Validate that exactly 3 cards are selected
@@ -465,10 +485,14 @@ class HeartsGame:
                             break # Exit loop after valid selection
                         except ValueError as e:
                             # Direct print for immediate feedback on invalid input
-                            print(log_with_timestamp(self.player_id, f"[PLAYER] Invalid input: {e} Please try again."))
+                            self.output_message(f"[PLAYER] Invalid input: {e} Please try again.", level="INFO")
+                        except EOFError: # Handle Ctrl+D during input
+                            self.output_message("[PLAYER] Input aborted. Exiting card selection.", level="INFO")
+                            self.cards_to_pass = [] # Ensure no cards are passed
+                            return # Exit from card selection
                         except Exception as e:
-                            # Direct print for other unexpected errors during input
-                            print(log_with_timestamp(self.player_id, f"[PLAYER] An unexpected error occurred: {e}. Please try again."))
+                            # Direct print for immediate feedback to input
+                            self.output_message(f"[PLAYER] An unexpected error occurred: {e}. Please try again.", level="INFO")
 
                     self.pass_selected_cards() # Proceed to pass the selected cards
                 
@@ -665,7 +689,7 @@ class HeartsGame:
                 for p_id, card_b in self.current_trick:
                     try:
                         v, s = protocol.decode_card(card_b)
-                        s_sym = protocol.SUIT_SYMBOLS.get(s, '?') # Assumes SUIT_SYMBOLS in protocol.py
+                        s_sym = {"DIAMONDS": "♦", "CLUBS": "♣", "HEARTS": "♥", "SPADES": "♠"}.get(s, '?')
                         self.output_message(f"  Player {p_id}: {v}{s_sym}", level="INFO", timestamp=False)
                     except Exception as e: # Should not happen if cards are valid
                         self.output_message(f"  Player {p_id}: ? ({card_b:02x}) - [DEBUG] decode error: {e}", level="DEBUG", timestamp=False)
@@ -687,7 +711,7 @@ class HeartsGame:
                 if card_in_hand_byte in valid_cards_bytes: # Check if the card from hand is in the list of valid plays
                     try:
                         value, suit = protocol.decode_card(card_in_hand_byte)
-                        suit_symbol = protocol.SUIT_SYMBOLS.get(suit, '?') # Assumes SUIT_SYMBOLS in protocol.py
+                        suit_symbol = {"DIAMONDS": "♦", "CLUBS": "♣", "HEARTS": "♥", "SPADES": "♠"}.get(suit, '?')
                         valid_plays_display.append(f"[{i}] {value}{suit_symbol}")
                     except: # Should not fail if decode worked in get_valid_plays
                         valid_plays_display.append(f"[{i}] ?({card_in_hand_byte:02x})")
@@ -699,7 +723,10 @@ class HeartsGame:
             while True:
                 try:
                     # Direct input for interactive prompt
-                    raw_input_str = input(log_with_timestamp(self.player_id, "Select a card to play (enter index): "))
+                    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    prompt_message = "Select a card to play (enter index): "
+                    input_prompt = f"[{ts}] Player {self.player_id}: {prompt_message}"
+                    raw_input_str = input(input_prompt)
                     selected_idx = int(raw_input_str) # Convert input to integer
 
                     # Validate index is within the bounds of the player's hand
@@ -715,10 +742,13 @@ class HeartsGame:
                     break # Exit loop once valid input is received
                 except ValueError as e:
                     # Direct print for immediate feedback to input
-                    print(log_with_timestamp(self.player_id, f"[PLAYER] Invalid input: {e} Please try again."))
+                    self.output_message(f"[PLAYER] Invalid input: {e} Please try again.", level="INFO")
+                except EOFError: # Handle Ctrl+D during input
+                    self.output_message("[PLAYER] Input aborted. No card played.", level="INFO")
+                    return # Exit from card playing
                 except Exception as e:
                     # Direct print for immediate feedback to input
-                    print(log_with_timestamp(self.player_id, f"[PLAYER] An unexpected error occurred: {e}. Please try again."))
+                    self.output_message(f"[PLAYER] An unexpected error occurred: {e}. Please try again.", level="INFO")
             
             if selected_card_byte:
                 self.play_card(selected_card_byte) # Play the validated selected card
@@ -739,7 +769,7 @@ class HeartsGame:
             - If leading (and not holding 2♣, or 2♣ already played), cannot lead Hearts or Q♠ unless
               only point cards (Hearts and/or Q♠) are held.
         - Leading a trick (not the first trick):
-            - Cannot lead Hearts if hearts are not yet broken, unless only Hearts are held.
+            - Cannot lead Hearts if hearts are not broken, unless only Hearts are held.
         - Following suit (not the first trick):
             - Must follow the lead suit if possible.
             - If void in the lead suit, any card can be played (this is "sloughing" or "off-suit" play).
@@ -862,7 +892,7 @@ class HeartsGame:
         
         value, suit = protocol.decode_card(card_byte)
         suit_symbol = {"DIAMONDS": "♦", "CLUBS": "♣", "HEARTS": "♥", "SPADES": "♠"}
-        print(log_with_timestamp(self.player_id, f"Played {value}{suit_symbol[suit]}"))
+        self.output_message(f"Played {value}{suit_symbol[suit]}", level="INFO")
         
         # Check if hearts broken
         if suit == "HEARTS":
@@ -1009,11 +1039,12 @@ class HeartsGame:
                 # M0 gets to choose the scoring outcome.
                 while True:
                     # Direct input for interactive prompt with M0
-                    choice = input(log_with_timestamp("Dealer",
-                                                      "Options:\n"
-                                                      "  1. Score 0 points (others get 26 each).\n"
-                                                      "  2. Score 26 points (others get 0 from STM).\n"
-                                                      "Enter choice (1 or 2): "))
+                    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    prompt_message = ("Options:\\n"\
+                                      f"[{ts}] Dealer:   1. Score 0 points (others get 26 each).\\n"\
+                                      f"[{ts}] Dealer:   2. Score 26 points (others get 0 from STM).\\n"\
+                                      f"[{ts}] Dealer: Enter choice (1 or 2): ")
+                    choice = input(prompt_message)
                     if choice == '1': # M0 chooses to give others 26 points
                         self.output_message("Chose to score 0 points. Others get 26 each.", level="INFO", source_id="Dealer")
                         self.hand_scores = [26, 26, 26, 26] # Assign 26 to everyone initially
@@ -1030,7 +1061,7 @@ class HeartsGame:
                         break
                     else:
                         # Direct print for immediate feedback on invalid input
-                        print(log_with_timestamp("Dealer", "[PLAYER] Invalid choice. Please enter 1 or 2."))
+                        self.output_message("[DEALER] Invalid choice. Please enter 1 or 2.", level="INFO", source_id="Dealer")
             else: # Another player (not M0) shot the moon
                 self.output_message(f"🌙 SHOOTING THE MOON! Player {shoot_moon_player_id} got all 26 points!", level="INFO", source_id="Dealer")
                 # Standard STM scoring rule applies: shooter gets 0, others get 26.
