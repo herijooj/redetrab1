@@ -18,10 +18,11 @@ PORTS = {0: 47123, 1: 47124, 2: 47125, 3: 47126}
 NEXT_NODE_IPS = {0: "127.0.0.1", 1: "127.0.0.1", 2: "127.0.0.1", 3: "127.0.0.1"}
 
 class HeartsGame:
-    def __init__(self, player_id, verbose_mode=False):
+    def __init__(self, player_id, verbose_mode=False, autoplay=False):
         self.player_id = player_id
         self.is_dealer = (player_id == 0)  # M0 is the dealer/coordinator
         self.verbose_mode = verbose_mode
+        self.autoplay = autoplay
         
         # Game state
         self.hand = []  # List of card bytes
@@ -223,6 +224,27 @@ class HeartsGame:
             return
 
         self.output_message(f"--- Your Turn (Player {self.player_id}) to Pass ---", level="INFO", timestamp=False)
+
+        if self.autoplay:
+            if len(self.hand) < 3:
+                self.output_message("[PLAYER] Not enough cards to pass for autoplay.", level="INFO")
+                self.cards_to_pass = []
+                self.pass_selected_cards()
+                return
+
+            self.cards_to_pass = self.hand[:3]
+            # Optionally, display which cards were auto-selected for passing
+            selected_cards_display = []
+            for card_byte in self.cards_to_pass:
+                try:
+                    value, suit = protocol.decode_card(card_byte)
+                    suit_symbol = {"DIAMONDS": "♦", "CLUBS": "♣", "HEARTS": "♥", "SPADES": "♠"}
+                    selected_cards_display.append(f"{value}{suit_symbol[suit]}")
+                except:
+                    selected_cards_display.append(f"?({card_byte:02x})")
+            self.output_message(f"[AUTOPLAY] Auto-selected cards for passing: {', '.join(selected_cards_display)}", level="INFO")
+            self.pass_selected_cards()
+            return
 
         if self.player_id == 0: # This method is primarily for the Dealer (M0) to initiate passing
             if len(self.hand) < 3: # Check if player has enough cards
@@ -681,6 +703,23 @@ class HeartsGame:
             self.output_message("Must play 2♣ to start first trick", level="INFO")
             self.play_card(two_clubs) # Auto-play 2 of Clubs
         else:
+            if self.autoplay:
+                valid_cards_bytes = self.get_valid_plays()
+                if valid_cards_bytes:
+                    selected_card_byte = valid_cards_bytes[0] # Select the first valid card
+                    try:
+                        value, suit = protocol.decode_card(selected_card_byte)
+                        suit_symbol = {"DIAMONDS": "♦", "CLUBS": "♣", "HEARTS": "♥", "SPADES": "♠"}
+                        self.output_message(f"[AUTOPLAY] Auto-playing card: {value}{suit_symbol[suit]}", level="INFO")
+                    except: # Should not happen if decode worked in get_valid_plays
+                        self.output_message(f"[AUTOPLAY] Auto-playing card: ?({selected_card_byte:02x})", level="INFO")
+                    self.play_card(selected_card_byte)
+                else:
+                    # This case should ideally not be reached if player has cards and get_valid_plays is correct
+                    self.output_message("[AUTOPLAY] Error: No valid cards found to autoplay. Holding cards.", level="ERROR")
+                    # Potentially pass token or handle error, for now, it will fall through if not returning
+                return # Exit after autoplay action or error
+
             self.display_hand() # Show current hand with indices
 
             # Display current state of the trick for context
@@ -1360,9 +1399,11 @@ def main():
                        help="Player ID (0-3, where 0 is the dealer)")
     parser.add_argument("-v", "--verbose", action="store_true",
                        help="Enable verbose debug logging")
+    parser.add_argument("--auto", action="store_true",
+                       help="Enable autoplay mode")
     args = parser.parse_args()
     
-    game = HeartsGame(args.player_id, args.verbose)
+    game = HeartsGame(args.player_id, args.verbose, args.auto)
     game.start_network()
     game.process_messages()
 
