@@ -19,6 +19,8 @@ PORTS = {0: 47123, 1: 47124, 2: 47125, 3: 47126}
 NEXT_NODE_IPS = {0: "127.0.0.1", 1: "127.0.0.1", 2: "127.0.0.1", 3: "127.0.0.1"}
 
 # Helper function to clear the screen
+PLAYER_ACTION_TIMEOUT = 30  # Timeout in seconds for player actions
+
 def clear_screen():
     """Clears the terminal screen."""
     # For Linux/OS X
@@ -69,9 +71,70 @@ class HeartsGame:
         # Sequence counter for messages
         self.seq_counter = 0
         
+        # Timer management for player turns
+        self.turn_timer = None
+        self.player_action_due_time = None
+
         # Network
         self.network_node = None
         self.message_queue = queue.Queue()
+
+    def start_player_action_timer(self, timeout_duration):
+        """Starts or restarts the timer for the current player's action."""
+        if self.turn_timer is not None:
+            self.turn_timer.cancel()
+        self.player_action_due_time = time.time() + timeout_duration
+        self.turn_timer = threading.Timer(timeout_duration, self.handle_timeout)
+        self.turn_timer.daemon = True # Ensure timer thread doesn't block program exit
+        self.turn_timer.start()
+        self.output_message(f"[DEBUG] Player action timer started ({timeout_duration}s)", level="DEBUG")
+
+    def cancel_player_action_timer(self):
+        """Cancels the active player action timer."""
+        if self.turn_timer is not None:
+            self.turn_timer.cancel()
+            self.output_message("[DEBUG] Player action timer cancelled", level="DEBUG")
+        self.turn_timer = None
+        self.player_action_due_time = None
+
+    def handle_timeout(self):
+        """Handles the timeout event for a player's action."""
+        if not self.has_token: # Only act if this player still has the token
+            self.output_message("[DEBUG] Timeout triggered, but token no longer held. No action taken.", level="DEBUG")
+            return
+
+        self.output_message("Timeout! Performing default action.", level="INFO")
+
+        if self.current_phase == protocol.PHASE_PASSING:
+            if len(self.hand) >= 3:
+                # Default action: pass the first 3 cards
+                self.cards_to_pass = self.hand[:3]
+                self.output_message(f"Timeout: Default passing cards: {self.cards_to_pass}", level="DEBUG")
+                self.pass_selected_cards() # This will also cancel the timer
+            else:
+                # Not enough cards to pass, this state should ideally not be reached if logic is correct
+                self.output_message("Timeout: Not enough cards to pass by default.", level="INFO")
+                # If PASS_NONE is an option, this might be okay. Otherwise, it's a stall.
+                # For now, just cancel timer. Game might rely on dealer to move things if stuck.
+                self.cancel_player_action_timer()
+
+
+        elif self.current_phase == protocol.PHASE_TRICKS:
+            valid_plays = self.get_valid_plays()
+            if valid_plays:
+                # Default action: play the first valid card
+                card_to_play = valid_plays[0]
+                value, suit = protocol.decode_card(card_to_play) # For logging
+                self.output_message(f"Timeout: Default playing card: {value} of {suit}", level="DEBUG")
+                self.play_card(card_to_play) # This will also cancel the timer
+            else:
+                # No valid plays, this is a problematic state
+                self.output_message("Timeout: No valid cards to play by default. This may stall the game.", level="INFO")
+                # Cancel timer. Game might rely on dealer intervention or next state change.
+                self.cancel_player_action_timer()
+
+        # Ensure timer is cancelled if not done by action methods (pass_selected_cards/play_card should do it)
+        # self.cancel_player_action_timer() # Redundant if action methods always cancel
 
     def output_message(self, message, level="INFO", source_id=None, timestamp=True):
         """
@@ -230,6 +293,7 @@ class HeartsGame:
         Input validation ensures 3 distinct and valid card indices are chosen.
         The selected cards are stored in `self.cards_to_pass` before calling `pass_selected_cards`.
         """
+        clear_screen() # Clear screen before player's turn to pass
         if not self.has_token or self.cards_passed: # Should only be called if player has token and hasn't passed
             return
 
@@ -237,11 +301,12 @@ class HeartsGame:
 
         if self.player_id == 0: # This method is primarily for the Dealer (M0) to initiate passing
             if len(self.hand) < 3: # Check if player has enough cards
-                # This print remains direct as it's part of immediate input feedback loop.
-                # It's a player-facing error specific to their action.
-                self.output_message("[PLAYER] Not enough cards to pass.", level="INFO")
+                self.output_message("Not enough cards to pass. Cannot initiate passing.", level="INFO", source_id="Dealer")
                 self.cards_to_pass = [] # Ensure list is empty if no cards can be passed
-                self.pass_selected_cards() # Proceed, will do nothing if PASS_NONE or if cards_to_pass is not 3
+                # Potentially, dealer should just wait or this implies an issue.
+                # For now, this action mirrors previous logic of trying to proceed,
+                # which will likely do nothing if cards_to_pass isn't 3.
+                self.pass_selected_cards()
                 return
 
             self.display_hand() # Show hand with indices for selection
@@ -250,7 +315,8 @@ class HeartsGame:
             while True:
                 try:
                     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                    prompt_message = "Select 3 cards to pass (e.g., 0 1 2): "
+                    remaining_time_info = f"({PLAYER_ACTION_TIMEOUT}s timeout)"
+                    prompt_message = f"Select 3 cards to pass (e.g., 0 1 2) {remaining_time_info}: "
                     input_prompt = f"[{ts}] Player {self.player_id}: {prompt_message}"
                     raw_input_str = input(input_prompt)
 
@@ -318,8 +384,19 @@ class HeartsGame:
     
     def pass_selected_cards(self):
         """Pass the selected cards to target player."""
+        if self.has_token: # Player is taking an action
+            self.cancel_player_action_timer()
+
         if not self.has_token or len(self.cards_to_pass) != 3 or not self.network_node:
-            return
+            # Added a check for self.has_token here again because the original guard was only effective
+            # if the token was already lost. If the timer was cancelled above, but other conditions fail,
+            # we still should not proceed.
+            # However, the primary intent of the original guard was to ensure the player *should* be acting.
+            # If the action is taken (timer cancelled), but then e.g. network_node is None, it's a different issue.
+            # For now, let's refine the guard to be more explicit.
+            if not self.network_node or (self.pass_direction != protocol.PASS_NONE and len(self.cards_to_pass) != 3) :
+                 self.output_message(f"[DEBUG] Conditions not met for passing cards. Has token: {self.has_token}, Cards to pass count: {len(self.cards_to_pass)}, Network: {self.network_node is not None}", level="DEBUG")
+                 return
             
         target_id = self.get_pass_target()
         if target_id is None:
@@ -458,13 +535,19 @@ class HeartsGame:
                 # Logic for when a player receives the token during the PASSING phase
                 if (self.current_phase == protocol.PHASE_PASSING and 
                     not self.cards_passed and len(self.hand) >= 3): # Check if it's passing phase, cards not yet passed, and enough cards
-                    self.output_message(f"--- Your Turn (Player {self.player_id}) to Pass ---", level="INFO", timestamp=False)
 
                     # If current round is a "No Pass" round, skip selection and pass token
                     if self.pass_direction == protocol.PASS_NONE:
+                        # No screen clear here, just an informative message before token passes.
                         self.output_message("No passing this round. Passing token.", level="INFO")
+                        # Timer might have been started before this check, ensure it's cancelled.
+                        self.cancel_player_action_timer()
                         self.pass_token_to_next() # Player still needs to pass the token along
                         return
+
+                    clear_screen() # Clear screen for player's turn to pass
+                    self.output_message(f"--- Your Turn (Player {self.player_id}) to Pass ---", level="INFO", timestamp=False)
+                    self.start_player_action_timer(PLAYER_ACTION_TIMEOUT) # Start timer for passing
 
                     self.display_hand() # Show hand with indices for card selection
                     
@@ -473,7 +556,8 @@ class HeartsGame:
                         try:
                             # Direct input for interactive prompt
                             ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                            prompt_message = "Select 3 cards to pass (e.g., 0 1 2): "
+                            remaining_time_info = f"({PLAYER_ACTION_TIMEOUT}s timeout)"
+                            prompt_message = f"Select 3 cards to pass (e.g., 0 1 2) {remaining_time_info}: "
                             input_prompt = f"[{ts}] Player {self.player_id}: {prompt_message}"
                             raw_input_str = input(input_prompt)
                             selected_indices_str = raw_input_str.split() # Split input string into list
@@ -519,15 +603,18 @@ class HeartsGame:
                         two_clubs in self.hand):
                         if not self.is_dealer: # Dealer already knows it's their turn to play 2C from find_two_clubs_holder
                             self.output_message("I have 2♣! Starting first trick", level="INFO")
+                        self.start_player_action_timer(PLAYER_ACTION_TIMEOUT) # Start timer for playing
                         self.initiate_card_play()
                     elif (self.is_first_trick and len(self.current_trick) == 0 and 
                           two_clubs not in self.hand):
                         # Don't have 2♣ and first trick not started, pass token
                         if not self.is_dealer:
                             self.output_message("[DEBUG] Don't have 2♣, passing token", level="DEBUG")
+                        # No timer needed here as token is immediately passed
                         self.pass_token_to_next()
                     else:
                         # Normal card play during tricks (first trick started or later tricks)
+                        self.start_player_action_timer(PLAYER_ACTION_TIMEOUT) # Start timer for playing
                         self.initiate_card_play()
             else:
                 self.has_token = False
@@ -742,7 +829,8 @@ class HeartsGame:
                 try:
                     # Direct input for interactive prompt
                     ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                    prompt_message = "Select a card to play (enter index): "
+                    remaining_time_info = f"({PLAYER_ACTION_TIMEOUT}s timeout)"
+                    prompt_message = f"Select a card to play (enter index) {remaining_time_info}: "
                     input_prompt = f"[{ts}] Player {self.player_id}: {prompt_message}"
                     raw_input_str = input(input_prompt)
                     selected_idx = int(raw_input_str) # Convert input to integer
@@ -888,7 +976,11 @@ class HeartsGame:
 
     def play_card(self, card_byte):
         """Play a card and broadcast it."""
+        if self.has_token: # Player is taking an action by playing a card
+            self.cancel_player_action_timer()
+
         if card_byte not in self.hand or not self.network_node:
+            self.output_message(f"[DEBUG] Conditions not met for playing card. Card in hand: {card_byte in self.hand}, Network: {self.network_node is not None}", level="DEBUG")
             return
             
         # Remove card from hand
