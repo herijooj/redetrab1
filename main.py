@@ -3,19 +3,30 @@
 Hearts Game Implementation - Step 1: Game Initialization & Card Distribution
 Builds upon the working ring network test.
 """
-import argparse
-import queue
-import time
-import random
-import threading
+import os # Added import
+import queue # Added import because it is used in HeartsGame but not imported
+import random # Added import because it is used in HeartsGame but not imported
+import time # Added import because it is used in HeartsGame but not imported
+import argparse # Added import because it is used in main() but not imported
+import threading # Added import because it is used in HeartsGame but not imported
 from datetime import datetime
 
 from network import NetworkNode
-import protocol
+import protocol # Added import because it is used in HeartsGame but not imported
 
 # Configuration
 PORTS = {0: 47123, 1: 47124, 2: 47125, 3: 47126}
 NEXT_NODE_IPS = {0: "127.0.0.1", 1: "127.0.0.1", 2: "127.0.0.1", 3: "127.0.0.1"}
+
+# Helper function to clear the screen
+def clear_screen():
+    """Clears the terminal screen."""
+    # For Linux/OS X
+    if os.name == 'posix':
+        os.system('clear')
+    # For Windows
+    elif os.name == 'nt':
+        os.system('cls')
 
 class HeartsGame:
     def __init__(self, player_id, verbose_mode=False):
@@ -357,11 +368,13 @@ class HeartsGame:
     
     def handle_game_start(self, header, payload):
         """Handle GAME_START message."""
+        clear_screen()
         self.game_started = True
         self.output_message("Game started!", level="INFO")
     
     def handle_deal_hand(self, header, payload):
         """Handle DEAL_HAND message."""
+        clear_screen()
         if len(payload) != 13:
             self.output_message(f"[DEBUG] Invalid hand size: {len(payload)}", level="DEBUG")
             return
@@ -418,6 +431,7 @@ class HeartsGame:
     
     def handle_start_phase(self, header, payload):
         """Handle START_PHASE message."""
+        clear_screen() # Clear screen for all players when a new phase starts
         if len(payload) >= 1:
             phase = payload[0]
             self.current_phase = phase
@@ -560,6 +574,8 @@ class HeartsGame:
     
     def handle_trick_summary(self, header, payload):
         """Handle TRICK_SUMMARY message."""
+        # No clear_screen() here as per task, summary is usually appended or shown after play.
+        # The task file mentions handle_hand_summary, not handle_trick_summary for screen clearing.
         if len(payload) < 10:  # winner + (4 * (player_id + card)) + points = 1 + 8 + 1 = 10
             return
             
@@ -604,6 +620,7 @@ class HeartsGame:
     
     def start_tricks_phase(self):
         """Start the tricks phase (M0 only)."""
+        clear_screen() # Added clear_screen
         if not self.is_dealer or not self.network_node:
             return
             
@@ -666,10 +683,11 @@ class HeartsGame:
     def initiate_card_play(self):
         """
         Handles the process for a player to select and play a card.
-        - If it's the first trick and the player has the 2 of Clubs, it's played automatically if leading.
+        - If it\'s the first trick and the player has the 2 of Clubs, it\'s played automatically if leading.
         - Otherwise, displays hand, current trick, valid plays, and prompts for user input.
         - Validates the selected card index and ensures the chosen card is among the valid plays.
         """
+        clear_screen() # Added clear_screen()
         if not self.has_token or self.current_phase != protocol.PHASE_TRICKS:
             return
 
@@ -1215,6 +1233,7 @@ class HeartsGame:
     
     def handle_hand_summary(self, header, payload):
         """Handle HAND_SUMMARY message."""
+        clear_screen()
         if len(payload) < 9:  # 4 + 4 + 1 minimum
             return
             
@@ -1246,6 +1265,7 @@ class HeartsGame:
     
     def handle_game_over(self, header, payload):
         """Handle GAME_OVER message."""
+        clear_screen()
         if len(payload) < 5:
             return
             
