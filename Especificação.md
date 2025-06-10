@@ -43,8 +43,8 @@ Todas as mensagens têm um cabeçalho fixo seguido de um payload variável, em f
 | 0x04           | START_PHASE    | FASE (1 byte: 0=Passagem, 1=Vazas), SENTIDO_PASSAGEM (1 byte, se FASE=0) | M0 anuncia início da fase de passagem (com sentido) ou vazas (BROADCAST). |
 | 0x05           | PASS_CARDS     | CARTAS_PASSADAS (3 bytes)                              | Jogador envia 3 cartas para DESTINO_ID (com token).                       |
 | 0x06           | PLAY_CARD      | CARTA_JOGADA (1 byte)                                  | Jogador joga uma carta (BROADCAST, com token).                            |
-| 0x07           | TRICK_SUMMARY  | ID_GANHADOR_VAZA (1 byte), CARTAS_VAZA (4 bytes), PONTOS_VAZA (1 byte) | M0 anuncia ganhador, cartas e pontos da vaza (BROADCAST).                 |
-| 0x08           | HAND_SUMMARY   | PONTOS_MAO_J0..J3 (4 bytes), PONTOS_ACUM_J0..J3 (4 bytes), SHOOT_MOON (1 byte) | M0 anuncia pontuação da mão, acumulada e "Atirar na Lua" (BROADCAST).     |
+| 0x07           | TRICK_SUMMARY  | ID_GANHADOR_VAZA (1 byte), ID_JOGADOR_C1 (1 byte), CARTA_J1 (1 byte), ID_JOGADOR_C2 (1 byte), CARTA_J2 (1 byte), ID_JOGADOR_C3 (1 byte), CARTA_J3 (1 byte), ID_JOGADOR_C4 (1 byte), CARTA_J4 (1 byte), PONTOS_VAZA (1 byte) | M0 anuncia ganhador, cartas (com ID do jogador que jogou cada uma) e pontos da vaza (BROADCAST). Total 10 bytes de payload. |
+| 0x08           | HAND_SUMMARY   | PONTOS_MAO_J0..J3 (4 bytes), PONTOS_ACUM_J0..J3 (4 bytes), SHOOT_MOON (1 byte: 0xFF=Não, 0-3=ID do jogador) | M0 anuncia pontuação da mão, acumulada e "Atirar na Lua" (BROADCAST).     |
 | 0x09           | GAME_OVER      | ID_VENCEDOR (1 byte), PONTOS_FINAIS_J0..J3 (4 bytes)   | M0 anuncia fim do jogo e vencedor (BROADCAST).                            |
 
 **Notas:**
@@ -62,7 +62,7 @@ Uma carta é codificada em 1 byte:
 - **Bits 4-5 (Naipe):** 0: Ouros (♦), 1: Paus (♣), 2: Copas (♥), 3: Espadas (♠).
 - **Bits 6-7:** Zeros.
 
-**Exemplo:** Dama de Espadas (Q♠) → Valor=12 (1100), Naipe=3 (11) → 11110000 (binário) → 0xF0 (hex).
+**Exemplo:** Dama de Espadas (Q♠) → Valor=12 (1100), Naipe=3 (11) → `00111100` (binário) → `0x3C` (hex).
 
 ---
 
