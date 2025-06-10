@@ -582,17 +582,14 @@ class HeartsGame:
         winner_id = payload[0]
         trick_points = payload[-1]  # Last byte is points
         
-        # Determine display_count for trick summary header
-        local_display_trick_count = 0
-        if self.is_dealer:
-            local_display_trick_count = min(self.trick_count +1, 13) # trick_count not yet incremented for current trick
-        else:
-            if not hasattr(self, 'local_trick_display_count'): # Should be init in deal_hand
-                self.local_trick_display_count = 0
-            local_display_trick_count = min(self.local_trick_display_count +1, 13)
+        # All players (including M0) use the same local display counter logic
+        if not hasattr(self, 'local_trick_display_count'):
+            self.local_trick_display_count = 0
+        self.local_trick_display_count += 1
+        local_display_trick_count = min(self.local_trick_display_count, 13)
 
         self.output_message(f"--- Trick Summary (Trick {local_display_trick_count}/13) ---", level="INFO", timestamp=False)
-        self.output_message(f"🏆 Player {winner_id} wins trick with {trick_points} points", level="INFO")
+        self.output_message(f"🏆 Player {winner_id} wins trick {local_display_trick_count}/13 with {trick_points} points", level="INFO")
         
         self.output_message("Cards played this trick:", level="INFO")
         for i in range(4):
@@ -608,13 +605,6 @@ class HeartsGame:
         # Reset local trick state for all players
         self.current_trick = []
         self.is_first_trick = False
-        
-        # Only the dealer should manage the official trick count and game flow
-        if self.is_dealer:
-            # The trick count (for dealer) or local_trick_display_count (for others)
-            # is updated *after* this summary is processed by the respective methods.
-            # So, the local_display_trick_count used above is correct for current trick.
-            pass # No specific print here about "completed tricks X/13" as it's part of summary header
         
         self.output_message("="*40, level="INFO", timestamp=False) # Separator
     
@@ -1023,7 +1013,7 @@ class HeartsGame:
         - Determines if any player "Shot the Moon" (STM) by collecting all 26 points.
         - If the dealer (M0) is the STM achiever, M0 is prompted to choose the scoring outcome:
             1. M0 scores 0 points, and all other players score 26 points.
-            2. M0 scores 26 points, and all other players score 0 points (from the STM effect).
+            2. M0 scores 26 points, and all other players score 0 (from the STM effect).
         - If another player (not M0) achieves STM, standard STM scoring is applied: the shooter scores 0,
           and all other players (including M0) score 26 points.
         - If no player shoots the moon, scores are assigned based on points collected in tricks.
