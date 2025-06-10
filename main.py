@@ -1,930 +1,843 @@
 #!/usr/bin/env python3
-"""
-Hearts Game Implementation - Step 1: Game Initialization & Card Distribution
-Builds upon the working ring network test.
-"""
-import os # Added import
-import queue # Added import because it is used in HeartsGame but not imported
-import random # Added import because it is used in HeartsGame but not imported
-import time # Added import because it is used in HeartsGame but not imported
-import argparse # Added import because it is used in main() but not imported
-import threading # Added import because it is used in HeartsGame but not imported
+import os
+import queue
+import random
+import time
+import argparse
+import threading
+import signal
+import sys
 from datetime import datetime
-
 from network import NetworkNode
-import protocol # Added import because it is used in HeartsGame but not imported
+import protocol
 
-# Configuration
+# Game Configuration Constants
 PORTS = {0: 47123, 1: 47124, 2: 47125, 3: 47126}
 NEXT_NODE_IPS = {0: "127.0.0.1", 1: "127.0.0.1", 2: "127.0.0.1", 3: "127.0.0.1"}
 
-# Helper function to clear the screen
-def clear_screen():
-    """Clears the terminal screen."""
-    # For Linux/OS X
-    if os.name == 'posix':
-        os.system('clear')
-    # For Windows
-    elif os.name == 'nt':
-        os.system('cls')
+# Game Constants
+CARDS_PER_HAND = 13
+CARDS_TO_PASS = 3
+MAX_TRICKS_PER_HAND = 13
+GAME_END_SCORE = 100
+SHOOT_MOON_POINTS = 26
+
+# Timeout Constants
+INPUT_TIMEOUT = 30  # 30 seconds for user input
+TOKEN_TIMEOUT = 60  # 60 seconds to detect stuck tokens
+GAME_TIMEOUT = 300  # 5 minutes maximum per hand
+
+# UI Constants
+CARD_SYMBOLS = {"DIAMONDS": "♦", "CLUBS": "♣", "HEARTS": "♥", "SPADES": "♠"}
+PASS_DIRECTION_NAMES = {0: "LEFT", 1: "RIGHT", 2: "ACROSS", 3: "NONE"}
+
+class TimeoutInput:
+    """Helper class for input with timeout."""
+    
+    def __init__(self, timeout=30):
+        self.timeout = timeout
+        self.result = None
+        
+    def input_with_timeout(self, prompt):
+        """Get input with timeout. Returns None if timeout occurs."""
+        def target():
+            try:
+                self.result = input(prompt)
+            except EOFError:
+                self.result = None
+                
+        thread = threading.Thread(target=target)
+        thread.daemon = True
+        thread.start()
+        thread.join(self.timeout)
+        
+        if thread.is_alive():
+            # Timeout occurred
+            return None
+        return self.result
+
 
 class HeartsGame:
-    def __init__(self, player_id, verbose_mode=False):
+    """
+    Hearts card game implementation for 4 players in a ring network.
+    Player 0 acts as the dealer/coordinator.
+    """
+    
+    def __init__(self, player_id, verbose_mode=False, auto_mode=False):
+        """Initialize a Hearts game player."""
         self.player_id = player_id
-        self.is_dealer = (player_id == 0)  # M0 is the dealer/coordinator
+        self.is_dealer = (player_id == 0)
         self.verbose_mode = verbose_mode
+        self.auto_mode = auto_mode
+        
+        # Initialize logging for dealer (always enabled for dealer)
+        self.log_file = None
+        if self.is_dealer:
+            self._setup_game_log()
         
         # Game state
-        self.hand = []  # List of card bytes
+        self._initialize_game_state()
+        
+        # Network
+        self.seq_counter = 0
+        self.network_node = None
+        self.message_queue = queue.Queue()
+        
+        # Dealer-specific state
+        if self.is_dealer:
+            self._initialize_dealer_state()
+        
+        # Message handlers
+        self.message_handlers = {
+            protocol.GAME_START: self.handle_game_start,
+            protocol.DEAL_HAND: self.handle_deal_hand,
+            protocol.START_PHASE: self.handle_start_phase,
+            protocol.TOKEN_PASS: self.handle_token_pass,
+            protocol.PASS_CARDS: self.handle_pass_cards,
+            protocol.PLAY_CARD: self.handle_play_card,
+            protocol.TRICK_SUMMARY: self.handle_trick_summary,
+            protocol.HAND_SUMMARY: self.handle_hand_summary,
+            protocol.GAME_OVER: self.handle_game_over,
+        }
+
+    def _setup_game_log(self):
+        """Setup game log file for dealer."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_filename = f"hearts_game_log_{timestamp}.txt"
+        try:
+            self.log_file = open(log_filename, 'w', encoding='utf-8')
+            self.log_file.write(f"Hearts Game Log - Started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            self.log_file.write("="*80 + "\n\n")
+            self.log_file.flush()
+            self.output_message(f"Game log created: {log_filename}", level="INFO", source_id="Dealer")
+        except Exception as e:
+            self.output_message(f"Failed to create log file: {e}", level="DEBUG", source_id="Dealer")
+            self.log_file = None
+
+    def log_game_event(self, event_type, message, extra_data=None):
+        """Log game events to file (dealer only)."""
+        if not (self.is_dealer and self.log_file):
+            return
+        
+        try:
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            log_entry = f"[{timestamp}] [{event_type}] {message}\n"
+            
+            if extra_data:
+                log_entry += f"    Extra: {extra_data}\n"
+            
+            self.log_file.write(log_entry)
+            self.log_file.flush()
+        except Exception as e:
+            self.output_message(f"Logging error: {e}", level="DEBUG", source_id="Dealer")
+
+    def clear_screen(self):
+        """Clear the terminal screen only if verbose mode is disabled."""
+        if not self.verbose_mode:
+            os.system('clear')
+
+    def _initialize_game_state(self):
+        """Initialize basic game state variables."""
+        self.hand = []
         self.game_started = False
         self.cards_received = False
-        
-        # Score tracking
-        self.hand_scores = [0, 0, 0, 0]  # Points for current hand (each player)
-        self.total_scores = [0, 0, 0, 0]  # Accumulated total scores (each player)
+        self.hand_scores = [0, 0, 0, 0]
+        self.total_scores = [0, 0, 0, 0]
         self.game_over = False
-        self.hand_number = 1  # Track which hand we're on
+        self.hand_number = 1
+        self.has_token = (self.player_id == 0)
         
-        # Token and phase management
-        self.has_token = (player_id == 0)  # M0 starts with token
-        self.current_phase = None  # 0=PASSING, 1=TRICKS
-        self.pass_direction = None  # 0=LEFT, 1=RIGHT, 2=ACROSS, 3=NONE
-        self.cards_to_pass = []  # Cards selected for passing
+        # Phase management
+        self.current_phase = None
+        self.pass_direction = None
+        self.cards_to_pass = []
         self.cards_passed = False
         self.passing_complete = False
         
-        # Trick state management
-        self.current_trick = []  # List of (player_id, card_byte) tuples
+        # Trick management
+        self.current_trick = []
         self.trick_count = 0
         self.hearts_broken = False
         self.is_first_trick = True
         
-        # M0 tracks game state
-        if self.is_dealer:
-            self.pass_cards_received = set()  # Track which players have passed
-            self.two_clubs_holder = None  # Who has 2♣
-            self.trick_winner = None  # Winner of current trick
-            self.trick_points_won = [0, 0, 0, 0]  # Points each player won this hand
-        
-        # Sequence counter for messages
-        self.seq_counter = 0
-        
-        # Network
-        self.network_node = None
-        self.message_queue = queue.Queue()
+        # CRITICAL FIX: Prevent multiple card plays in same trick
+        self.played_card_this_trick = False
+
+    def _initialize_dealer_state(self):
+        """Initialize dealer-specific state variables."""
+        self.pass_cards_received = set()
+        self.two_clubs_holder = None
+        self.trick_winner = None
+        self.trick_points_won = [0, 0, 0, 0]
+
+    # ============================================================================
+    # UTILITY METHODS
+    # ============================================================================
 
     def output_message(self, message, level="INFO", source_id=None, timestamp=True):
-        """
-        Centralized method for printing game and debug messages.
-        Respects verbose_mode for DEBUG level messages.
-
-        Args:
-            message (str): The message content to print.
-            level (str): "INFO" for player-facing, "DEBUG" for verbose debugging.
-            source_id (any): Identifier for the message source (e.g., player ID, "Dealer").
-                             Defaults to self.player_id.
-            timestamp (bool): Whether to include a timestamp in the output.
-        """
+        """Output a formatted message with optional timestamp and source."""
         if level == "DEBUG" and not self.verbose_mode:
             return
-
-        if source_id is None:
-            source_id = self.player_id
-
+            
+        source_id = self.player_id if source_id is None else source_id
+        
         if timestamp:
             ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            if isinstance(source_id, int): # Player ID
+            if isinstance(source_id, int):
                 print(f"[{ts}] Player {source_id}: {message}")
-            else: # Source like "Dealer", "Game"
+            else:
                 print(f"[{ts}] {source_id}: {message}")
         else:
-            # For messages without timestamp, source_id might not be relevant or already in message
             print(message)
 
     def get_next_seq(self):
-        """Get next sequence number for outgoing messages."""
+        """Get the next sequence number for outgoing messages."""
         val = self.seq_counter
         self.seq_counter = (self.seq_counter + 1) % 256
         return val
-    
+
+    def display_hand(self):
+        """Display the current hand with card indices."""
+        if not self.hand:
+            self.output_message("No cards in hand", level="INFO")
+            return
+            
+        self.output_message("Hand:", level="INFO")
+        cards_str = []
+        
+        for i, card_byte in enumerate(self.hand):
+            try:
+                value, suit = protocol.decode_card(card_byte)
+                cards_str.append(f"[{i}] {value}{CARD_SYMBOLS[suit]}")
+            except:
+                cards_str.append(f"[{i}] ?({card_byte:02x})")
+        
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        print(f"[{ts}]   " + " ".join(cards_str))
+
+    def _format_card_display(self, card_byte):
+        """Format a single card for display."""
+        try:
+            value, suit = protocol.decode_card(card_byte)
+            return f"{value}{CARD_SYMBOLS[suit]}"
+        except:
+            return f"?({card_byte:02x})"
+
+    def _get_pass_target(self, direction):
+        """Get the target player ID for card passing based on direction."""
+        pass_targets = {
+            protocol.PASS_LEFT: (self.player_id + 1) % 4,
+            protocol.PASS_RIGHT: (self.player_id - 1) % 4,
+            protocol.PASS_ACROSS: (self.player_id + 2) % 4
+        }
+        return pass_targets.get(direction)
+
+    # ============================================================================
+    # NETWORK METHODS
+    # ============================================================================
+
     def start_network(self):
-        """Initialize and start network communication."""
+        """Initialize and start the network node."""
         my_port = PORTS[self.player_id]
         next_player_id = (self.player_id + 1) % 4
         next_node_ip = NEXT_NODE_IPS[self.player_id]
         next_node_port = PORTS[next_player_id]
         
         self.network_node = NetworkNode(
-            self.player_id, my_port, next_node_ip, next_node_port, self.message_queue, self.verbose_mode # Pass verbose_mode
+            self.player_id, my_port, next_node_ip, next_node_port, 
+            self.message_queue, self.verbose_mode
         )
         self.network_node.start()
-        self.output_message(f"[DEBUG] Network started on port {my_port}", level="DEBUG")
-    
-    def create_deck(self):
-        """Create a shuffled 52-card deck (M0 only)."""
-        if not self.is_dealer:
-            return None
-            
-        deck = []
-        suits = ["DIAMONDS", "CLUBS", "HEARTS", "SPADES"]
-        values = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
-        
-        for suit in suits:
-            for value in values:
-                # Encode card according to protocol specification
-                card_byte = protocol.encode_card(value, suit)
-                deck.append(card_byte)
-        
-        random.shuffle(deck)
-        self.output_message(f"[DEBUG] Created and shuffled deck of {len(deck)} cards", level="DEBUG", source_id="Dealer")
-        return deck
-    
-    def deal_cards(self):
-        """Deal 13 cards to each player (M0 only)."""
-        if not self.is_dealer or not self.network_node:
+        self.output_message(f"Network started on port {my_port}", level="DEBUG")
+
+    def pass_token_to_player(self, target_player):
+        """Pass the token to another player."""
+        if not self.network_node:
             return
             
-        deck = self.create_deck()
-        if not deck:
-            return
-            
-        self.output_message("[DEBUG] Dealing cards to all players...", level="DEBUG", source_id="Dealer")
+        self.has_token = False
+        self.network_node.send_message(
+            protocol.TOKEN_PASS, self.player_id, protocol.BROADCAST_ID, 
+            self.get_next_seq(), bytes([target_player])
+        )
         
-        # Deal 13 cards to each player
-        for player_id in range(4):
-            hand_cards = deck[player_id * 13:(player_id + 1) * 13]
-            hand_bytes = bytes(hand_cards)
-            
-            seq = self.get_next_seq()
-            self.network_node.send_message(
-                protocol.DEAL_HAND, 
-                self.player_id, 
-                player_id, 
-                seq, 
-                hand_bytes
-            )
-            self.output_message(f"[DEBUG] Sent {len(hand_cards)} cards to Player {player_id}", level="DEBUG", source_id="Dealer")
-    
+        identifier = "Dealer" if self.is_dealer else self.player_id
+        self.output_message(f"Passed token to Player {target_player}", level="DEBUG", source_id=identifier)
+
+    # ============================================================================
+    # GAME INITIALIZATION METHODS (DEALER ONLY)
+    # ============================================================================
+
     def start_game(self):
-        """Start the game by broadcasting GAME_START (M0 only)."""
+        """Start a new Hearts game (dealer only)."""
         if not self.is_dealer or not self.network_node:
             return
             
-        self.output_message("[DEBUG] Starting Hearts game...", level="DEBUG", source_id="Dealer")
-        
-        # Set initial pass direction for first hand
+        self.log_game_event("GAME_START", "Hearts game started")
+        self.output_message("Starting Hearts game...", level="DEBUG", source_id="Dealer")
         self.pass_direction = protocol.PASS_LEFT
         
-        seq = self.get_next_seq()
+        # Send game start message
         self.network_node.send_message(
-            protocol.GAME_START,
-            self.player_id,
-            protocol.BROADCAST_ID,
-            seq
+            protocol.GAME_START, self.player_id, protocol.BROADCAST_ID, self.get_next_seq()
         )
         
-        # Wait a moment for GAME_START to circulate, then deal cards
         time.sleep(0.5)
         self.deal_cards()
-        
-        # Start the passing phase after dealing
         time.sleep(1)
         self.start_passing_phase()
-    
-    def start_passing_phase(self):
-        """Start the card passing phase (M0 only)."""
+
+    def deal_cards(self):
+        """Create and deal a shuffled deck to all players (dealer only)."""
         if not self.is_dealer or not self.network_node:
             return
-
-        # For the dealer, pass_direction should be set to an int before this method is called.
-        assert self.pass_direction is not None, \
-            "Dealer's pass_direction cannot be None when starting passing phase"
             
-        # Use the already set pass_direction (rotated in start_next_hand)
-        direction_names = {0: "LEFT", 1: "RIGHT", 2: "ACROSS", 3: "NONE"}
-        # self.pass_direction is now known to be an int by the type checker
-        direction_name = direction_names.get(self.pass_direction, "UNKNOWN")
-        self.output_message(f"[DEBUG] Starting card passing phase (pass {direction_name})", level="DEBUG", source_id="Dealer")
-        self.output_message(f"Pass direction: {direction_name}", level="INFO", source_id="Dealer") # Player-facing for M0
+        # Create full deck
+        suits = ["DIAMONDS", "CLUBS", "HEARTS", "SPADES"]
+        values = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+        deck = [protocol.encode_card(v, s) for s in suits for v in values]
+        random.shuffle(deck)
+        
+        self.log_game_event("DEAL_CARDS", f"Hand {self.hand_number} - Shuffled and dealing {len(deck)} cards")
+        
+        # Log all hands being dealt
+        hands_dealt = {}
+        for player_id in range(4):
+            start_idx = player_id * CARDS_PER_HAND
+            end_idx = start_idx + CARDS_PER_HAND
+            hand_cards = deck[start_idx:end_idx]
+            hands_dealt[player_id] = [self._format_card_display(c) for c in hand_cards]
+            
+            self.network_node.send_message(
+                protocol.DEAL_HAND, self.player_id, player_id, 
+                self.get_next_seq(), bytes(hand_cards)
+            )
+            self.output_message(f"Sent {len(hand_cards)} cards to Player {player_id}", level="DEBUG", source_id="Dealer")
+        
+        # Log complete hand distribution
+        for player_id, cards in hands_dealt.items():
+            self.log_game_event("HAND_DEALT", f"Player {player_id} dealt: {' '.join(cards)}")
+        
+        self.output_message(f"Created and shuffled deck of {len(deck)} cards", level="DEBUG", source_id="Dealer")
+        self.output_message("Dealing cards...", level="DEBUG", source_id="Dealer")
 
-        # Broadcast START_PHASE message
-        # self.pass_direction is an int here
+    # ============================================================================
+    # CARD PASSING PHASE METHODS
+    # ============================================================================
+
+    def start_passing_phase(self):
+        """Start the card passing phase (dealer only)."""
+        if not self.is_dealer or not self.network_node:
+            return
+            
+        assert self.pass_direction is not None, "Dealer's pass_direction cannot be None"
+        
+        direction_name = PASS_DIRECTION_NAMES.get(self.pass_direction, "UNKNOWN")
+        self.log_game_event("PHASE_START", f"Hand {self.hand_number} - Starting passing phase", 
+                          f"Direction: {direction_name}")
+        self.output_message(f"Starting pass phase (pass {direction_name})", level="DEBUG", source_id="Dealer")
+        self.output_message(f"Pass direction: {direction_name}", level="INFO", source_id="Dealer")
+        
+        # Send phase start message
         payload = bytes([protocol.PHASE_PASSING, self.pass_direction])
-        seq = self.get_next_seq()
         self.network_node.send_message(
-            protocol.START_PHASE,
-            self.player_id,
-            protocol.BROADCAST_ID,
-            seq,
-            payload
+            protocol.START_PHASE, self.player_id, protocol.BROADCAST_ID, 
+            self.get_next_seq(), payload
         )
         
-        # M0 starts with the token, so it can pass first
-        time.sleep(0.5)  # Give message time to circulate
+        time.sleep(0.5)
         self.initiate_card_passing()
-    
+
     def initiate_card_passing(self):
-        """
-        Handles the card passing process when this player (M0/Dealer) is the first to pass.
-        It involves displaying the hand and prompting M0 for manual selection of 3 cards.
-        Input validation ensures 3 distinct and valid card indices are chosen.
-        The selected cards are stored in `self.cards_to_pass` before calling `pass_selected_cards`.
-        """
-        if not self.has_token or self.cards_passed: # Should only be called if player has token and hasn't passed
+        """Start card passing for the current player."""
+        if not self.has_token or self.cards_passed:
             return
-
+            
         self.output_message(f"--- Your Turn (Player {self.player_id}) to Pass ---", level="INFO", timestamp=False)
+        
+        if len(self.hand) < CARDS_TO_PASS:
+            self.output_message("Not enough cards to pass.", level="INFO")
+            self.log_game_event("PASSING_ERROR", f"Player {self.player_id} has insufficient cards to pass ({len(self.hand)} < {CARDS_TO_PASS})")
+            self.pass_selected_cards()
+            return
+        
+        self.display_hand()
+        self._get_cards_to_pass_from_user()
 
-        if self.player_id == 0: # This method is primarily for the Dealer (M0) to initiate passing
-            if len(self.hand) < 3: # Check if player has enough cards
-                # This print remains direct as it's part of immediate input feedback loop.
-                # It's a player-facing error specific to their action.
-                self.output_message("[PLAYER] Not enough cards to pass.", level="INFO")
-                self.cards_to_pass = [] # Ensure list is empty if no cards can be passed
-                self.pass_selected_cards() # Proceed, will do nothing if PASS_NONE or if cards_to_pass is not 3
-                return
-
-            self.display_hand() # Show hand with indices for selection
-            
-            # Loop to get valid card selection from user
-            while True:
-                try:
-                    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                    prompt_message = "Select 3 cards to pass (e.g., 0 1 2): "
-                    input_prompt = f"[{ts}] Player {self.player_id}: {prompt_message}"
-                    raw_input_str = input(input_prompt)
-
-                    selected_indices_str = raw_input_str.strip().split()
-                    if len(selected_indices_str) != 3:
-                        self.output_message(
-                            "[PLAYER] Invalid input. Must select exactly 3 cards. Please enter 3 distinct numbers separated by spaces.", 
-                            level="INFO"
-                        )
-                        continue
-                    
-                    selected_indices = []
-                    valid_selection = True
-                    for idx_str in selected_indices_str:
-                        if not idx_str.isdigit():
-                            self.output_message(f"[PLAYER] Invalid card index: '{idx_str}'. Indices must be numbers.", level="INFO")
-                            valid_selection = False
-                            break
-                        idx = int(idx_str)
-                        if not (0 <= idx < len(self.hand)):
-                            self.output_message(f"[PLAYER] Invalid card index: {idx}. Please choose from 0 to {len(self.hand) - 1}.", level="INFO")
-                            valid_selection = False
-                            break
-                        selected_indices.append(idx)
-                    
-                    if not valid_selection:
-                        continue
-                        
-                    if len(set(selected_indices)) != 3:
-                        self.output_message("[PLAYER] Please select 3 *distinct* cards.", level="INFO")
-                        continue
-                        
-                    self.cards_to_pass = [self.hand[i] for i in selected_indices]
-                    # self.output_message(f"Selected card indices for passing: {selected_indices}", level="DEBUG")
-                    break # Exit loop if selection is valid
-
-                except ValueError:
-                    self.output_message("[PLAYER] Invalid input. Please enter numbers for card indices.", level="INFO")
-                except EOFError:
-                    self.output_message("[PLAYER] Input aborted. Exiting card selection.", level="INFO")
-                    self.cards_to_pass = [] # Ensure no cards are passed
-                    return # Exit from card selection
-                except Exception as e:
-                    self.output_message(f"[PLAYER] An unexpected error occurred during input: {e}. Please try again.", level="INFO")
-            
-            self.pass_selected_cards() # Proceed to pass the selected cards
-        else:
-            # This part of the function was originally for M0 only.
-            # If a non-M0 player somehow calls this, it's unexpected.
-            # For now, retain the old auto-select logic for non-M0, though it shouldn't be reached.
-            if len(self.hand) >= 3:
-                self.cards_to_pass = self.hand[:3] # Fallback, should not happen for non-M0 here
+    def _get_cards_to_pass_from_user(self):
+        """Get card selection from user input or auto-select in auto mode."""
+        if self.auto_mode:
+            # Auto mode: select first 3 cards
+            if len(self.hand) >= CARDS_TO_PASS:
+                self.cards_to_pass = self.hand[:CARDS_TO_PASS]
+                cards_str = [self._format_card_display(c) for c in self.cards_to_pass]
+                self.output_message(f"Auto-selected cards to pass: {' '.join(cards_str)}", level="INFO")
+                self.log_game_event("AUTO_PASS", f"Player {self.player_id} auto-selected cards to pass: {' '.join(cards_str)}")
                 self.pass_selected_cards()
-    
-    def get_pass_target(self):
-        """Get the target player ID based on pass direction."""
-        if self.pass_direction == protocol.PASS_LEFT:
-            return (self.player_id + 1) % 4
-        elif self.pass_direction == protocol.PASS_RIGHT:
-            return (self.player_id - 1) % 4
-        elif self.pass_direction == protocol.PASS_ACROSS:
-            return (self.player_id + 2) % 4
-        else:  # PASS_NONE
-            return None
-    
+                return
+            else:
+                self.output_message("Not enough cards to pass in auto mode.", level="INFO")
+                self.log_game_event("AUTO_PASS_ERROR", f"Player {self.player_id} insufficient cards for auto-pass ({len(self.hand)} < {CARDS_TO_PASS})")
+                self.pass_selected_cards()
+                return
+        
+        # Manual mode: get user input with timeout
+        timeout_input = TimeoutInput(INPUT_TIMEOUT)
+        
+        while True:
+            try:
+                ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                prompt = f"[{ts}] Player {self.player_id}: Select 3 cards to pass (e.g., 0 1 2): "
+                
+                user_input = timeout_input.input_with_timeout(prompt)
+                if user_input is None:
+                    # Timeout occurred - auto-select first 3 cards
+                    self.output_message(f"Input timeout ({INPUT_TIMEOUT}s) - auto-selecting first 3 cards", level="INFO")
+                    self.log_game_event("INPUT_TIMEOUT", f"Player {self.player_id} input timeout during card passing ({INPUT_TIMEOUT}s) - auto-selecting cards")
+                    if len(self.hand) >= CARDS_TO_PASS:
+                        self.cards_to_pass = self.hand[:CARDS_TO_PASS]
+                        cards_str = [self._format_card_display(c) for c in self.cards_to_pass]
+                        self.output_message(f"Auto-selected cards: {' '.join(cards_str)}", level="INFO")
+                        self.log_game_event("TIMEOUT_AUTO_PASS", f"Player {self.player_id} timeout auto-selected: {' '.join(cards_str)}")
+                    else:
+                        self.cards_to_pass = []
+                        self.log_game_event("TIMEOUT_PASS_ERROR", f"Player {self.player_id} timeout with insufficient cards ({len(self.hand)} < {CARDS_TO_PASS})")
+                    self.pass_selected_cards()
+                    return
+                
+                indices_str = user_input.strip().split()
+                
+                if len(indices_str) != CARDS_TO_PASS:
+                    raise ValueError(f"Must select exactly {CARDS_TO_PASS} cards.")
+                
+                indices = [int(i) for i in indices_str]
+                
+                if len(set(indices)) != CARDS_TO_PASS:
+                    raise ValueError("Must select 3 distinct cards.")
+                
+                if any(not (0 <= i < len(self.hand)) for i in indices):
+                    raise ValueError("Card index out of range.")
+                
+                self.cards_to_pass = [self.hand[i] for i in indices]
+                cards_str = [self._format_card_display(c) for c in self.cards_to_pass]
+                self.log_game_event("MANUAL_PASS", f"Player {self.player_id} manually selected cards to pass: {' '.join(cards_str)}")
+                break
+                
+            except (ValueError, IndexError) as e:
+                self.output_message(f"Invalid selection: {e}. Please try again.", level="INFO")
+                self.log_game_event("PASS_INPUT_ERROR", f"Player {self.player_id} invalid card selection: {e}")
+            except Exception as e:
+                self.output_message(f"Input error: {e}. Auto-selecting cards.", level="INFO")
+                self.log_game_event("PASS_INPUT_EXCEPTION", f"Player {self.player_id} input exception: {e} - auto-selecting")
+                if len(self.hand) >= CARDS_TO_PASS:
+                    self.cards_to_pass = self.hand[:CARDS_TO_PASS]
+                else:
+                    self.cards_to_pass = []
+                break
+        
+        self.pass_selected_cards()
+
     def pass_selected_cards(self):
-        """Pass the selected cards to target player."""
-        if not self.has_token or len(self.cards_to_pass) != 3 or not self.network_node:
+        """Send the selected cards to the appropriate player."""
+        if not self.has_token or len(self.cards_to_pass) != CARDS_TO_PASS or not self.network_node:
             return
             
-        target_id = self.get_pass_target()
+        target_id = self._get_pass_target(self.pass_direction)
         if target_id is None:
             return
-            
+        
         # Remove cards from hand
         for card in self.cards_to_pass:
             if card in self.hand:
                 self.hand.remove(card)
         
-        # Send PASS_CARDS message
-        payload = bytes(self.cards_to_pass)
-        seq = self.get_next_seq()
+        # Send pass cards message
         self.network_node.send_message(
-            protocol.PASS_CARDS,
-            self.player_id,
-            target_id,
-            seq,
-            payload
+            protocol.PASS_CARDS, self.player_id, target_id, 
+            self.get_next_seq(), bytes(self.cards_to_pass)
         )
+        
+        # Log the card passing event
+        try:
+            passed_cards = [self._format_card_display(c) for c in self.cards_to_pass]
+            self.log_game_event("CARDS_PASSED", 
+                              f"Player {self.player_id} passed to Player {target_id}: {' '.join(passed_cards)}")
+        except Exception as e:
+            self.log_game_event("CARDS_PASSED", 
+                              f"Player {self.player_id} passed 3 cards to Player {target_id} (display error)")
         
         self.output_message(f"Passed 3 cards to Player {target_id}", level="INFO")
         self.cards_passed = True
-        
-        # Pass token to next player
-        self.pass_token_to_next()
-    
-    def pass_token_to_next(self):
-        """Pass token to the next player in sequence."""
-        if not self.has_token or not self.network_node:
-            return
-            
-        next_player = (self.player_id + 1) % 4
-        self.has_token = False
-        
-        payload = bytes([next_player])
-        seq = self.get_next_seq()
-        self.network_node.send_message(
-            protocol.TOKEN_PASS,
-            self.player_id,
-            protocol.BROADCAST_ID,
-            seq,
-            payload
-        )
-        self.output_message(f"[DEBUG] Passed token to Player {next_player}", level="DEBUG")
-    
-    def handle_game_start(self, header, payload):
-        """Handle GAME_START message."""
-        clear_screen()
-        self.game_started = True
-        self.output_message("Game started!", level="INFO")
-    
-    def handle_deal_hand(self, header, payload):
-        """Handle DEAL_HAND message."""
-        clear_screen()
-        if len(payload) != 13:
-            self.output_message(f"[DEBUG] Invalid hand size: {len(payload)}", level="DEBUG")
-            return
+        self.pass_token_to_player((self.player_id + 1) % 4)
 
-        self.output_message(f"==================== HAND {self.hand_number} ====================", level="INFO", timestamp=False)
-            
-        self.hand = list(payload)
-        self.cards_received = True # This flag might be useful elsewhere
-        
-        # Log receipt of new hand
-        self.output_message(f"Received {len(self.hand)} cards for a new hand", level="INFO")
-        self.display_hand()
+    # ============================================================================
+    # TRICKS PHASE METHODS
+    # ============================================================================
 
-        # Reset states that are per-hand for ALL players
-        self.is_first_trick = True
-        self.hearts_broken = False
-        if hasattr(self, '_hearts_broken_announced'):
-            del self._hearts_broken_announced
-        self.current_trick = [] # Clear any remnants of a previous trick locally
-
-        # Reset local trick display count specifically for non-dealers
-        # The dealer's official trick_count is reset in start_next_hand()
-        if not self.is_dealer:
-            if hasattr(self, 'local_trick_display_count'): # Check if attr exists before resetting
-                self.local_trick_display_count = 0
-            # else: it will be initialized in handle_trick_summary if needed
-    
-    def display_hand(self):
-        """
-        Displays the player's current hand with each card prefixed by its index.
-        This is crucial for manual card selection during passing and playing.
-        Example: "[0] AH", "[1] KD".
-        """
-        if not self.hand:
-            self.output_message("No cards in hand", level="INFO") # Player-facing message
-            return
-            
-        self.output_message("Hand:", level="INFO") # Title for the hand display
-        cards_str = []
-        
-        # Enumerate hand to get indices for selection, displayed alongside card representation
-        for i, card_byte in enumerate(self.hand):
-            try:
-                value, suit = protocol.decode_card(card_byte)
-                suit_symbol = {"DIAMONDS": "♦", "CLUBS": "♣", "HEARTS": "♥", "SPADES": "♠"}
-                cards_str.append(f"[{i}] {value}{suit_symbol[suit]}")
-            except:
-                cards_str.append(f"[{i}] ?({card_byte:02x})")
-        
-        # Sort and display nicely
-        # This direct print is for the hand itself, part of display_hand's responsibility
-        current_ts_for_hand = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        print(f"[{current_ts_for_hand}]   " + " ".join(cards_str))
-    
-    def handle_start_phase(self, header, payload):
-        """Handle START_PHASE message."""
-        clear_screen() # Clear screen for all players when a new phase starts
-        if len(payload) >= 1:
-            phase = payload[0]
-            self.current_phase = phase
-            
-            if phase == protocol.PHASE_PASSING and len(payload) >= 2:
-                self.pass_direction = payload[1]
-                direction_names = {0: "LEFT", 1: "RIGHT", 2: "ACROSS", 3: "NONE"}
-                self.output_message(f"Passing phase started - direction: {direction_names.get(self.pass_direction, 'UNKNOWN')}", level="INFO")
-            elif phase == protocol.PHASE_TRICKS:
-                self.output_message("Tricks phase started!", level="INFO")
-                # Reset passing state for all players
-                self.cards_passed = False
-                self.cards_to_pass = []
-    
-    def handle_token_pass(self, header, payload):
-        """Handle TOKEN_PASS message."""
-        if len(payload) >= 1:
-            new_token_owner = payload[0]
-            
-            if new_token_owner == self.player_id:
-                self.has_token = True
-                self.output_message("[DEBUG] Received token!", level="DEBUG")
-                
-                # Logic for when a player receives the token during the PASSING phase
-                if (self.current_phase == protocol.PHASE_PASSING and 
-                    not self.cards_passed and len(self.hand) >= 3): # Check if it's passing phase, cards not yet passed, and enough cards
-                    self.output_message(f"--- Your Turn (Player {self.player_id}) to Pass ---", level="INFO", timestamp=False)
-
-                    # If current round is a "No Pass" round, skip selection and pass token
-                    if self.pass_direction == protocol.PASS_NONE:
-                        self.output_message("No passing this round. Passing token.", level="INFO")
-                        self.pass_token_to_next() # Player still needs to pass the token along
-                        return
-
-                    self.display_hand() # Show hand with indices for card selection
-                    
-                    # Loop to get valid card selection from the user
-                    while True:
-                        try:
-                            # Direct input for interactive prompt
-                            ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                            prompt_message = "Select 3 cards to pass (e.g., 0 1 2): "
-                            input_prompt = f"[{ts}] Player {self.player_id}: {prompt_message}"
-                            raw_input_str = input(input_prompt)
-                            selected_indices_str = raw_input_str.split() # Split input string into list
-
-                            # Validate that exactly 3 cards are selected
-                            if len(selected_indices_str) != 3:
-                                raise ValueError("Please select exactly 3 cards.")
-
-                            selected_indices = []
-                            for s_idx in selected_indices_str:
-                                idx = int(s_idx) # Convert string index to integer
-                                # Validate index is within the bounds of the hand
-                                if not (0 <= idx < len(self.hand)):
-                                    raise ValueError(f"Index {idx} is out of range. Max index is {len(self.hand) - 1}.")
-                                selected_indices.append(idx)
-
-                            # Validate that 3 distinct card indices are chosen
-                            if len(set(selected_indices)) != 3:
-                                raise ValueError("Please select 3 distinct cards.")
-
-                            # All checks passed: store the actual card bytes from hand
-                            self.cards_to_pass = [self.hand[i] for i in selected_indices]
-                            break # Exit loop after valid selection
-                        except ValueError as e:
-                            # Direct print for immediate feedback on invalid input
-                            self.output_message(f"[PLAYER] Invalid input: {e} Please try again.", level="INFO")
-                        except EOFError: # Handle Ctrl+D during input
-                            self.output_message("[PLAYER] Input aborted. Exiting card selection.", level="INFO")
-                            self.cards_to_pass = [] # Ensure no cards are passed
-                            return # Exit from card selection
-                        except Exception as e:
-                            # Direct print for immediate feedback to input
-                            self.output_message(f"[PLAYER] An unexpected error occurred: {e}. Please try again.", level="INFO")
-
-                    self.pass_selected_cards() # Proceed to pass the selected cards
-                
-                # If in tricks phase, check for 2♣ or play card
-                elif self.current_phase == protocol.PHASE_TRICKS:
-                    two_clubs = protocol.encode_card("2", "CLUBS")
-                    
-                    # If this is first trick and no cards played yet and player has 2♣
-                    if (self.is_first_trick and len(self.current_trick) == 0 and 
-                        two_clubs in self.hand):
-                        if not self.is_dealer: # Dealer already knows it's their turn to play 2C from find_two_clubs_holder
-                            self.output_message("I have 2♣! Starting first trick", level="INFO")
-                        self.initiate_card_play()
-                    elif (self.is_first_trick and len(self.current_trick) == 0 and 
-                          two_clubs not in self.hand):
-                        # Don't have 2♣ and first trick not started, pass token
-                        if not self.is_dealer:
-                            self.output_message("[DEBUG] Don't have 2♣, passing token", level="DEBUG")
-                        self.pass_token_to_next()
-                    else:
-                        # Normal card play during tricks (first trick started or later tricks)
-                        self.initiate_card_play()
-            else:
-                self.has_token = False
-    
-    def handle_play_card(self, header, payload):
-        """Handle PLAY_CARD message."""
-        if len(payload) != 1:
-            return
-            
-        card_byte = payload[0]
-        origin_id = header["origin_id"]
-        
-        # Add card to current trick
-        self.current_trick.append((origin_id, card_byte))
-        
-        # Display the played card
-        try:
-            value, suit = protocol.decode_card(card_byte)
-            suit_symbol = {"DIAMONDS": "♦", "CLUBS": "♣", "HEARTS": "♥", "SPADES": "♠"}
-            self.output_message(f"→ Player {origin_id} played {value}{suit_symbol[suit]}", level="INFO")
-            
-            # Check if hearts broken
-            if suit == "HEARTS":
-                self.hearts_broken = True
-                if not hasattr(self, '_hearts_broken_announced'):
-                    self.output_message("💔 Hearts have been broken!", level="INFO")
-                    self._hearts_broken_announced = True
-                    
-        except Exception as e:
-            self.output_message(f"[DEBUG] → Player {origin_id} played card (decode error: {e})", level="DEBUG")
-        
-        # Show current trick status
-        self.output_message(f"[DEBUG] Trick progress: {len(self.current_trick)}/4 cards played", level="DEBUG")
-        
-        # Handle trick completion and token passing
-        if len(self.current_trick) < 4:
-            # Pass token to next player if this was our own message coming back
-            if origin_id == self.player_id and self.has_token:
-                self.pass_token_to_next()
-        else:
-            # Trick complete - M0 calculates winner
-            if self.is_dealer:
-                self.calculate_trick_winner()
-    
-    def handle_trick_summary(self, header, payload):
-        """Handle TRICK_SUMMARY message."""
-        # No clear_screen() here as per task, summary is usually appended or shown after play.
-        # The task file mentions handle_hand_summary, not handle_trick_summary for screen clearing.
-        if len(payload) < 10:  # winner + (4 * (player_id + card)) + points = 1 + 8 + 1 = 10
-            return
-            
-        winner_id = payload[0]
-        trick_points = payload[-1]  # Last byte is points
-        
-        # All players (including M0) use the same local display counter logic
-        if not hasattr(self, 'local_trick_display_count'):
-            self.local_trick_display_count = 0
-        self.local_trick_display_count += 1
-        local_display_trick_count = min(self.local_trick_display_count, 13)
-
-        self.output_message(f"--- Trick Summary (Trick {local_display_trick_count}/13) ---", level="INFO", timestamp=False)
-        self.output_message(f"🏆 Player {winner_id} wins trick {local_display_trick_count}/13 with {trick_points} points", level="INFO")
-        
-        self.output_message("Cards played this trick:", level="INFO")
-        for i in range(4):
-            p_id_in_trick = payload[1 + i * 2] # Renamed to avoid conflict
-            card_byte_in_trick = payload[2 + i * 2] # Renamed
-            try:
-                value, suit = protocol.decode_card(card_byte_in_trick)
-                suit_symbol = {"DIAMONDS": "♦", "CLUBS": "♣", "HEARTS": "♥", "SPADES": "♠"}
-                self.output_message(f"  Player {p_id_in_trick}: {value}{suit_symbol[suit]}", level="INFO", timestamp=False)
-            except:
-                self.output_message(f"  Player {p_id_in_trick}: [DEBUG] [card decode error]", level="DEBUG", timestamp=False)
-        
-        # Reset local trick state for all players
-        self.current_trick = []
-        self.is_first_trick = False
-        
-        self.output_message("="*40, level="INFO", timestamp=False) # Separator
-    
     def start_tricks_phase(self):
-        """Start the tricks phase (M0 only)."""
-        clear_screen() # Added clear_screen
+        """Start the tricks playing phase (dealer only)."""
+        self.clear_screen()
         if not self.is_dealer or not self.network_node:
             return
             
-        self.output_message("[DEBUG] Starting tricks phase...", level="DEBUG", source_id="Dealer")
-        
-        # M0 should update its own phase immediately
+        self.log_game_event("PHASE_START", f"Hand {self.hand_number} - Starting tricks phase")
+        self.output_message("Starting tricks phase...", level="DEBUG", source_id="Dealer")
         self.current_phase = protocol.PHASE_TRICKS
-        # Reset passing-related flags, similar to what handle_start_phase does for TRICKS
         self.cards_passed = False
         self.cards_to_pass = []
-
-        # Send START_PHASE message for tricks
-        payload = bytes([protocol.PHASE_TRICKS])  # FASE=1 for tricks
-        seq = self.get_next_seq()
+        
+        # Send phase start message
         self.network_node.send_message(
-            protocol.START_PHASE,
-            self.player_id,
-            protocol.BROADCAST_ID,
-            seq,
-            payload
+            protocol.START_PHASE, self.player_id, protocol.BROADCAST_ID, 
+            self.get_next_seq(), bytes([protocol.PHASE_TRICKS])
         )
         
-        # Find who has 2♣ and give them the token
-        time.sleep(0.5)  # Give message time to circulate
-        self.find_two_clubs_holder()
-    
-    def find_two_clubs_holder(self):
-        """Find who has 2♣ and give them the token to start first trick."""
-        # Encode 2♣ (value=2, suit=CLUBS=1)
-        two_clubs = protocol.encode_card("2", "CLUBS")
+        time.sleep(0.5)
         
-        if two_clubs in self.hand: # Dealer has 2 of clubs
-            self.output_message(f"[DEBUG] Player {self.player_id} (self) has 2♣ - starting first trick", level="DEBUG", source_id="Dealer")
+        # Find who has 2 of clubs and give them the token
+        two_clubs = protocol.encode_card("2", "CLUBS")
+        if two_clubs in self.hand:
+            self.output_message(f"Player {self.player_id} (self) has 2♣ - starting", level="DEBUG", source_id="Dealer")
             self.two_clubs_holder = self.player_id
+            self.log_game_event("TOKEN_PASS", f"Dealer has 2♣, keeping token to start first trick")
             self.has_token = True
             self.initiate_card_play()
         else:
-            # Check other players by giving them token to see if they have 2♣
-            self.output_message("[DEBUG] 2♣ not found in own hand - checking other players...", level="DEBUG", source_id="Dealer")
-            self.check_for_two_clubs(1)  # Start checking from player 1
-    
-    def check_for_two_clubs(self, player_to_check):
-        """Give token to next player to check if they have 2♣."""
-        if player_to_check >= 4 or not self.network_node:
-            self.output_message("[DEBUG] Error - 2♣ not found in any player!", level="DEBUG", source_id="Dealer")
-            return
-            
-        self.has_token = False
-        payload = bytes([player_to_check])
-        seq = self.get_next_seq()
-        self.network_node.send_message(
-            protocol.TOKEN_PASS,
-            self.player_id,
-            protocol.BROADCAST_ID,
-            seq,
-            payload
-        )
-        self.output_message(f"[DEBUG] Checking if Player {player_to_check} has 2♣...", level="DEBUG", source_id="Dealer")
+            self.output_message("2♣ not in hand - checking others...", level="DEBUG", source_id="Dealer")
+            self.pass_token_to_player(1)
 
     def initiate_card_play(self):
-        """
-        Handles the process for a player to select and play a card.
-        - If it\'s the first trick and the player has the 2 of Clubs, it\'s played automatically if leading.
-        - Otherwise, displays hand, current trick, valid plays, and prompts for user input.
-        - Validates the selected card index and ensures the chosen card is among the valid plays.
-        """
-        clear_screen() # Added clear_screen()
+        """Start card play for the current player."""
+        self.clear_screen()
         if not self.has_token or self.current_phase != protocol.PHASE_TRICKS:
             return
-
-        self.output_message(f"--- Your Turn (Player {self.player_id}) to Play ---", level="INFO", timestamp=False)
             
+        self.output_message(f"--- Your Turn (Player {self.player_id}) to Play ---", level="INFO", timestamp=False)
+        
+        # Handle mandatory 2 of clubs play
         two_clubs = protocol.encode_card("2", "CLUBS")
-        # Forced play of 2 of Clubs on the very first play of the hand if leading
         if self.is_first_trick and len(self.current_trick) == 0 and two_clubs in self.hand:
             self.output_message("Must play 2♣ to start first trick", level="INFO")
-            self.play_card(two_clubs) # Auto-play 2 of Clubs
+            self.play_card(two_clubs)
+            return
+        
+        self.display_hand()
+        self._display_current_trick()
+        
+        valid_cards = self.get_valid_plays()
+        if not valid_cards:
+            self.output_message("Error: No valid cards found. Playing first card.", level="INFO")
+            if self.hand:
+                self.play_card(self.hand[0])
+            return
+        
+        self._display_valid_plays(valid_cards)
+        self._get_card_play_from_user(valid_cards)
+
+    def _display_current_trick(self):
+        """Display the cards already played in the current trick."""
+        if self.current_trick:
+            self.output_message("Current trick:", level="INFO")
+            for player_id, card_byte in self.current_trick:
+                try:
+                    card_display = self._format_card_display(card_byte)
+                    self.output_message(f"  Player {player_id}: {card_display}", level="INFO", timestamp=False)
+                except:
+                    self.output_message(f"  Player {player_id}: ? ({card_byte:02x})", level="DEBUG", timestamp=False)
         else:
-            self.display_hand() # Show current hand with indices
+            self.output_message("You are leading the trick.", level="INFO")
 
-            # Display current state of the trick for context
-            if self.current_trick:
-                self.output_message("Current trick:", level="INFO")
-                for p_id, card_b in self.current_trick:
-                    try:
-                        v, s = protocol.decode_card(card_b)
-                        s_sym = {"DIAMONDS": "♦", "CLUBS": "♣", "HEARTS": "♥", "SPADES": "♠"}.get(s, '?')
-                        self.output_message(f"  Player {p_id}: {v}{s_sym}", level="INFO", timestamp=False)
-                    except Exception as e: # Should not happen if cards are valid
-                        self.output_message(f"  Player {p_id}: ? ({card_b:02x}) - [DEBUG] decode error: {e}", level="DEBUG", timestamp=False)
+    def _display_valid_plays(self, valid_cards):
+        """Display the valid cards that can be played."""
+        valid_plays_str = []
+        for i, card in enumerate(self.hand):
+            if card in valid_cards:
+                card_display = self._format_card_display(card)
+                valid_plays_str.append(f"[{i}] {card_display}")
+        
+        self.output_message("Valid cards to play: " + ", ".join(valid_plays_str), level="INFO")
+
+    def _get_card_play_from_user(self, valid_cards):
+        """Get card selection from user for playing or auto-select in auto mode."""
+        if self.auto_mode:
+            # Auto mode: select first valid card
+            if valid_cards:
+                card_to_play = valid_cards[0]
+                card_display = self._format_card_display(card_to_play)
+                self.output_message(f"Auto-selected card to play: {card_display}", level="INFO")
+                self.log_game_event("AUTO_PLAY", f"Player {self.player_id} auto-selected card to play: {card_display}")
+                self.play_card(card_to_play)
+                return
             else:
-                self.output_message("You are leading the trick.", level="INFO")
-
-            # Get and display valid cards for the player to choose from
-            valid_cards_bytes = self.get_valid_plays()
-            if not valid_cards_bytes: # Should ideally not happen if player has cards
-                self.output_message("[PLAYER] Error: No valid cards found to play. Playing first card as fallback.", level="INFO")
-                if self.hand: # Fallback if hand is not empty
-                    self.play_card(self.hand[0])
-                else: # Should be impossible in a valid game state
-                    self.output_message("[PLAYER] Error: No cards in hand to play.", level="INFO")
+                self.output_message("No valid cards available in auto mode.", level="INFO")
+                self.log_game_event("AUTO_PLAY_ERROR", f"Player {self.player_id} has no valid cards in auto mode")
+                return
+        
+        # Manual mode: get user input with timeout
+        timeout_input = TimeoutInput(INPUT_TIMEOUT)
+        
+        while True:
+            try:
+                ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                prompt = f"[{ts}] Player {self.player_id}: Select a card to play (enter index): "
+                
+                user_input = timeout_input.input_with_timeout(prompt)
+                if user_input is None:
+                    # Timeout occurred - auto-select first valid card
+                    self.output_message(f"Input timeout ({INPUT_TIMEOUT}s) - auto-selecting first valid card", level="INFO")
+                    self.log_game_event("INPUT_TIMEOUT", f"Player {self.player_id} input timeout during card playing ({INPUT_TIMEOUT}s) - auto-selecting card")
+                    if valid_cards:
+                        card_to_play = valid_cards[0]
+                        card_display = self._format_card_display(card_to_play)
+                        self.output_message(f"Auto-selected card: {card_display}", level="INFO")
+                        self.log_game_event("TIMEOUT_AUTO_PLAY", f"Player {self.player_id} timeout auto-selected: {card_display}")
+                        self.play_card(card_to_play)
+                    else:
+                        self.log_game_event("TIMEOUT_PLAY_ERROR", f"Player {self.player_id} timeout with no valid cards available")
+                    return
+                
+                idx = int(user_input.strip())
+                
+                if not (0 <= idx < len(self.hand)):
+                    raise ValueError("Index out of range.")
+                
+                selected_card = self.hand[idx]
+                
+                # STRICT VALIDATION: Double-check that the selected card is actually valid
+                if selected_card not in valid_cards:
+                    # Provide detailed error message about why the card is invalid
+                    card_display = self._format_card_display(selected_card)
+                    if self.current_trick:
+                        try:
+                            _, lead_suit = protocol.decode_card(self.current_trick[0][1])
+                            _, selected_suit = protocol.decode_card(selected_card)
+                            
+                            # Check if player has cards of lead suit
+                            has_lead_suit = any(
+                                protocol.decode_card(c)[1] == lead_suit 
+                                for c in self.hand 
+                                if c != selected_card  # Don't count the selected card
+                            )
+                            
+                            if has_lead_suit and selected_suit != lead_suit:
+                                self.output_message(f"INVALID: {card_display} - You must follow suit ({lead_suit}) when you have {lead_suit} cards!", level="INFO")
+                                # Show what cards they should play instead
+                                valid_displays = [self._format_card_display(c) for c in valid_cards]
+                                self.output_message(f"Valid cards: {', '.join(valid_displays)}", level="INFO")
+                                continue
+                            else:
+                                self.output_message(f"INVALID: {card_display} - This card violates Hearts rules", level="INFO")
+                                continue
+                        except Exception as e:
+                            self.output_message(f"INVALID: {card_display} - Not a valid play", level="INFO")
+                            continue
+                    else:
+                        self.output_message(f"INVALID: {card_display} - Cannot lead with this card", level="INFO")
+                        continue
+                
+                card_display = self._format_card_display(selected_card)
+                self.log_game_event("MANUAL_PLAY", f"Player {self.player_id} manually selected card to play: {card_display}")
+                self.play_card(selected_card)
+                break
+                
+            except (ValueError, IndexError) as e:
+                self.output_message(f"Invalid selection: {e}. Please try again.", level="INFO")
+                self.log_game_event("PLAY_INPUT_ERROR", f"Player {self.player_id} invalid card selection: {e}")
+            except Exception as e:
+                self.output_message(f"Input error: {e}. Auto-selecting card.", level="INFO")
+                self.log_game_event("PLAY_INPUT_EXCEPTION", f"Player {self.player_id} input exception: {e} - auto-selecting")
+                if valid_cards:
+                    card_to_play = valid_cards[0]
+                    self.play_card(card_to_play)
                 return
 
-            valid_plays_display = []
-            for i, card_in_hand_byte in enumerate(self.hand):
-                if card_in_hand_byte in valid_cards_bytes: # Check if the card from hand is in the list of valid plays
-                    try:
-                        value, suit = protocol.decode_card(card_in_hand_byte)
-                        suit_symbol = {"DIAMONDS": "♦", "CLUBS": "♣", "HEARTS": "♥", "SPADES": "♠"}.get(suit, '?')
-                        valid_plays_display.append(f"[{i}] {value}{suit_symbol}")
-                    except: # Should not fail if decode worked in get_valid_plays
-                        valid_plays_display.append(f"[{i}] ?({card_in_hand_byte:02x})")
-
-            self.output_message("Valid cards to play: " + ", ".join(valid_plays_display), level="INFO")
-
-            selected_card_byte = None
-            # Loop to get a valid card selection from the user
-            while True:
-                try:
-                    # Direct input for interactive prompt
-                    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                    prompt_message = "Select a card to play (enter index): "
-                    input_prompt = f"[{ts}] Player {self.player_id}: {prompt_message}"
-                    raw_input_str = input(input_prompt)
-                    selected_idx = int(raw_input_str) # Convert input to integer
-
-                    # Validate index is within the bounds of the player's hand
-                    if not (0 <= selected_idx < len(self.hand)):
-                        raise ValueError(f"Index {selected_idx} is out of range for your hand.")
-
-                    candidate_card = self.hand[selected_idx] # Get the card byte from hand using selected index
-                    # Crucially, check if the chosen card (by index) is in the pre-calculated valid_cards_bytes list
-                    if candidate_card not in valid_cards_bytes:
-                        raise ValueError(f"Card at index {selected_idx} is not a valid play according to game rules.")
-
-                    selected_card_byte = candidate_card # Store the validated card byte
-                    break # Exit loop once valid input is received
-                except ValueError as e:
-                    # Direct print for immediate feedback to input
-                    self.output_message(f"[PLAYER] Invalid input: {e} Please try again.", level="INFO")
-                except EOFError: # Handle Ctrl+D during input
-                    self.output_message("[PLAYER] Input aborted. No card played.", level="INFO")
-                    return # Exit from card playing
-                except Exception as e:
-                    # Direct print for immediate feedback to input
-                    self.output_message(f"[PLAYER] An unexpected error occurred: {e}. Please try again.", level="INFO")
-            
-            if selected_card_byte:
-                self.play_card(selected_card_byte) # Play the validated selected card
-            else:
-                # This fallback should ideally not be reached if the loop and validation are correct
-                self.output_message("[PLAYER] Error: No card selected. Playing first valid card as fallback.", level="INFO")
-                if valid_cards_bytes: # Ensure there's at least one valid card
-                    self.play_card(valid_cards_bytes[0])
-
     def get_valid_plays(self):
-        """
-        Determines and returns a list of card bytes from the player's hand that are valid to play.
-        This method implements the core card playing rules of Hearts:
-        - First trick:
-            - If leading and holding 2 of Clubs (2♣), it must be played. (This is enforced by `initiate_card_play`).
-            - If not leading, must follow suit. If void in lead suit, cannot play point cards (Hearts or Q♠)
-              unless no other non-point cards are available.
-            - If leading (and not holding 2♣, or 2♣ already played), cannot lead Hearts or Q♠ unless
-              only point cards (Hearts and/or Q♠) are held.
-        - Leading a trick (not the first trick):
-            - Cannot lead Hearts if hearts are not broken, unless only Hearts are held.
-        - Following suit (not the first trick):
-            - Must follow the lead suit if possible.
-            - If void in the lead suit, any card can be played (this is "sloughing" or "off-suit" play).
-        """
-        if not self.hand: # Should not happen in a normal game if player has cards
+        """Get list of valid cards that can be played according to Hearts rules."""
+        if not self.hand:
             return []
-
-        # valid_cards = [] # This variable was defined but not used; removed.
-        two_of_clubs = protocol.encode_card("2", "CLUBS")
-        # queen_of_spades = protocol.encode_card("Q", "SPADES") # Defined but not directly used by this name
-
-        # Rule 1: First trick specific logic
+        
+        try:
+            two_of_clubs = protocol.encode_card("2", "CLUBS")
+        except Exception as e:
+            self.output_message(f"Error encoding 2 of clubs: {e}", level="DEBUG")
+            return list(self.hand)  # Fallback: return all cards
+        
+        # First trick special rules
         if self.is_first_trick:
-            # If player has 2 of Clubs:
-            #   - If leading: `initiate_card_play` handles the forced play of 2♣.
-            #     So, if this method is called when leading and 2♣ is held, it means it's the only valid play.
-            #   - If following: 2♣ is only valid if Clubs was led or if void in lead suit (and 2C is a Club).
-            #     The general suit-following logic below will correctly handle if 2♣ (a Club) is playable.
-            # The specific case for 2♣ being the *only* card if held and leading is handled before calling this.
-            # If it's the first trick and 2 of clubs is in hand, and player is leading,
-            # initiate_card_play would have auto-played it. If this method is still called,
-            # it implies something else, or it's for a follower.
-            # If player must play 2C (e.g. leading first trick), it's the only valid play.
-            if two_of_clubs in self.hand and not self.current_trick: # Leading first trick with 2C
-                 return [two_of_clubs]
+            return self._get_first_trick_valid_plays(two_of_clubs)
+        
+        # Regular trick rules
+        if self.current_trick:
+            return self._get_following_valid_plays()
+        else:
+            return self._get_leading_valid_plays()
 
+    def _get_first_trick_valid_plays(self, two_of_clubs):
+        """Get valid plays for the first trick."""
+        # Must lead with 2 of clubs if available
+        if two_of_clubs in self.hand and not self.current_trick:
+            return [two_of_clubs]
+        
+        # Following in first trick
+        if self.current_trick:
+            try:
+                _, lead_suit = protocol.decode_card(self.current_trick[0][1])
+                cards_in_suit = []
+                for c in self.hand:
+                    try:
+                        _, suit = protocol.decode_card(c)
+                        if suit == lead_suit:
+                            cards_in_suit.append(c)
+                    except Exception as e:
+                        self.output_message(f"Error decoding card in hand: {e}", level="DEBUG")
+                        continue
+                
+                if cards_in_suit:
+                    return cards_in_suit
+                
+                # Can't play points in first trick
+                non_point_cards = []
+                for c in self.hand:
+                    try:
+                        value, suit = protocol.decode_card(c)
+                        is_heart = (suit == "HEARTS")
+                        is_queen_spades = (value == "Q" and suit == "SPADES")
+                        if not (is_heart or is_queen_spades):
+                            non_point_cards.append(c)
+                    except Exception as e:
+                        self.output_message(f"Error decoding card for points check: {e}", level="DEBUG")
+                        # If we can't decode it, assume it's not a point card
+                        non_point_cards.append(c)
+                
+                return non_point_cards if non_point_cards else list(self.hand)
+            except Exception as e:
+                self.output_message(f"Error in first trick following logic: {e}", level="DEBUG")
+                return list(self.hand)
+        
+        # Leading first trick (not with 2♣)
+        non_point_cards = []
+        for c in self.hand:
+            try:
+                value, suit = protocol.decode_card(c)
+                is_heart = (suit == "HEARTS")
+                is_queen_spades = (value == "Q" and suit == "SPADES")
+                if not (is_heart or is_queen_spades):
+                    non_point_cards.append(c)
+            except Exception as e:
+                self.output_message(f"Error decoding card for leading first trick: {e}", level="DEBUG")
+                # If we can't decode it, assume it's not a point card
+                non_point_cards.append(c)
+        
+        return non_point_cards if non_point_cards else list(self.hand)
 
-            # Following suit on the first trick
-            if self.current_trick:
-                lead_suit_byte = self.current_trick[0][1]
-                _, lead_suit = protocol.decode_card(lead_suit_byte)
+    def _get_following_valid_plays(self):
+        """Get valid plays when following suit."""
+        if not self.current_trick:
+            # This shouldn't happen, but if it does, treat as leading
+            return self._get_leading_valid_plays()
+        
+        try:
+            _, lead_suit = protocol.decode_card(self.current_trick[0][1])
+        except Exception as e:
+            self.output_message(f"CRITICAL ERROR: Cannot decode lead card: {e}", level="INFO")
+            # This is a critical error - we cannot continue without knowing the lead suit
+            # Return empty list to force error handling at higher level
+            return []
+        
+        cards_in_suit = []
+        
+        # Check each card in hand for the lead suit
+        for card in self.hand:
+            try:
+                _, suit = protocol.decode_card(card)
+                if suit == lead_suit:
+                    cards_in_suit.append(card)
+            except Exception as e:
+                # If we can't decode a card, we can't know its suit, so we can't allow it
+                self.output_message(f"Warning: Cannot decode card in hand: {e}", level="DEBUG")
+                continue
+        
+        # STRICT SUIT FOLLOWING ENFORCEMENT
+        if cards_in_suit:
+            # Player has cards of the lead suit - MUST play one of them
+            if self.verbose_mode:
+                lead_suit_cards = [self._format_card_display(c) for c in cards_in_suit]
+                self.output_message(f"ENFORCING suit following ({lead_suit}): {' '.join(lead_suit_cards)}", level="DEBUG")
+            return cards_in_suit
+        
+        # Player has no cards of the lead suit - may play any card they can decode
+        playable_cards = []
+        for card in self.hand:
+            try:
+                protocol.decode_card(card)  # Just check if it's decodable
+                playable_cards.append(card)
+            except Exception:
+                # Skip cards we can't decode
+                continue
+        
+        if self.verbose_mode:
+            self.output_message(f"No {lead_suit} cards - may play any card", level="DEBUG")
+        
+        return playable_cards if playable_cards else list(self.hand)  # Emergency fallback
+        
 
-                cards_in_led_suit = [card for card in self.hand if protocol.decode_card(card)[1] == lead_suit]
-                if cards_in_led_suit:
-                    return cards_in_led_suit # Must follow suit
-
-                # Cannot follow suit on the first trick:
-                # Can play any card EXCEPT point cards (Hearts or Q♠), unless only point cards are left.
-                non_point_cards_available = []
-                point_cards_held = []
-                for card_byte in self.hand:
-                    value, suit = protocol.decode_card(card_byte)
-                    if suit == "HEARTS" or (suit == "SPADES" and value == "Q"):
-                        point_cards_held.append(card_byte)
-                    else:
-                        non_point_cards_available.append(card_byte)
-
-                if non_point_cards_available: # If non-point cards can be played, they are the only valid ones
-                    return non_point_cards_available
-                else: # Otherwise, player must play a point card (as it's all they have)
-                    return point_cards_held
-            else: # Leading the first trick (2♣ is not held, otherwise `initiate_card_play` would have played it)
-                  # Cannot lead with Hearts or Q♠ unless hand contains ONLY Hearts and/or Q♠.
-                non_point_cards_to_lead = []
-                point_cards_to_lead = [] # Not strictly needed by name, but for clarity
-                has_only_points = True
-                for card_byte in self.hand:
-                    value, suit = protocol.decode_card(card_byte)
-                    if suit == "HEARTS" or (suit == "SPADES" and value == "Q"):
-                        point_cards_to_lead.append(card_byte)
-                    else:
-                        non_point_cards_to_lead.append(card_byte)
-                        has_only_points = False
-
-                if not has_only_points: # If player has non-point cards, they must lead one of them
-                    return non_point_cards_to_lead
-                else: # Player only has point cards, so they can lead one (e.g. only Hearts and Q♠ left)
-                    return point_cards_to_lead
-
-        # Rule 2: Following suit (applies to any trick that is not the first, or first trick if 2C not involved initially)
-        if self.current_trick: # True if cards have been played in the current trick (i.e., player is following)
-            lead_suit_byte = self.current_trick[0][1] # Get the first card played in the trick
-            _, lead_suit = protocol.decode_card(lead_suit_byte) # Determine its suit
-
-            cards_in_led_suit = [card for card in self.hand if protocol.decode_card(card)[1] == lead_suit]
-            if cards_in_led_suit: # If player has cards of the lead suit, they must play one
-                return cards_in_led_suit
-            else:
-                # Cannot follow suit: player can play any card (sloughing/off-suit)
-                # On the first trick, this path is only taken if already handled point card restrictions above.
-                # For subsequent tricks, any card is fine.
-                return list(self.hand) # Return a copy of all cards in hand
-
-        # Rule 3: Leading a trick (not the first trick, as that's handled by `is_first_trick` block)
-        else: # Player is leading a trick (current_trick is empty)
-            # Cannot lead with Hearts if Hearts are not broken, unless player only has Hearts.
-            if not self.hearts_broken:
-                non_hearts_cards = [card for card in self.hand if protocol.decode_card(card)[1] != "HEARTS"]
-                if non_hearts_cards: # If player has non-Heart cards, they must lead one of them
-                    return non_hearts_cards
-
-            # If Hearts are broken, or if player only has Hearts, any card is valid to lead.
-            return list(self.hand) # Return a copy of all cards in hand
-
-        # Fallback: This should ideally not be reached if all conditions above are comprehensive.
-        # Returning all cards in hand is a safe default but might indicate a logic flaw if reached unexpectedly.
-        return list(self.hand) if self.hand else []
+    def _get_leading_valid_plays(self):
+        """Get valid plays when leading a trick."""
+        # Can't lead with hearts until broken
+        if not self.hearts_broken:
+            non_hearts = [c for c in self.hand if protocol.decode_card(c)[1] != "HEARTS"]
+            if non_hearts:
+                return non_hearts
+        
+        return list(self.hand)
 
     def play_card(self, card_byte):
-        """Play a card and broadcast it."""
+        """Play a card and broadcast it to all players."""
         if card_byte not in self.hand or not self.network_node:
             return
-            
-        # Remove card from hand
+        
+        # CRITICAL CHECK: Prevent playing multiple cards in the same trick
+        if self.played_card_this_trick:
+            self.output_message("Error: You have already played a card in this trick!", level="INFO")
+            return
+        
         self.hand.remove(card_byte)
-        
-        # Don't add to current_trick here - let handle_play_card do it
-        # when the message comes back around the ring
-        
-        # Broadcast PLAY_CARD message
-        payload = bytes([card_byte])
-        seq = self.get_next_seq()
         self.network_node.send_message(
-            protocol.PLAY_CARD,
-            self.player_id,
-            protocol.BROADCAST_ID,
-            seq,
-            payload
+            protocol.PLAY_CARD, self.player_id, protocol.BROADCAST_ID, 
+            self.get_next_seq(), bytes([card_byte])
         )
         
         value, suit = protocol.decode_card(card_byte)
-        suit_symbol = {"DIAMONDS": "♦", "CLUBS": "♣", "HEARTS": "♥", "SPADES": "♠"}
-        self.output_message(f"Played {value}{suit_symbol[suit]}", level="INFO")
+        card_display = self._format_card_display(card_byte)
+        self.output_message(f"Played {card_display}", level="INFO")
         
-        # Check if hearts broken
+        # Note: Card play logging is done in handle_play_card when message is received
+        # to avoid duplicate logging since all players receive the same message
+        
         if suit == "HEARTS":
             self.hearts_broken = True
         
-        # Don't pass token here - let handle_play_card do it when message comes back
-    
+        # Mark that the player has played a card in this trick
+        self.played_card_this_trick = True
+
+    # ============================================================================
+    # SCORING AND GAME END METHODS (DEALER ONLY)
+    # ============================================================================
+
     def calculate_trick_winner(self):
-        """Calculate who won the current trick (M0 only)."""
+        """Calculate the winner of the current trick (dealer only)."""
         if not self.is_dealer or len(self.current_trick) != 4:
             return
             
-        self.output_message("[DEBUG] Calculating trick winner...", level="DEBUG", source_id="Dealer")
-        
-        # Determine lead suit
-        lead_suit = protocol.decode_card(self.current_trick[0][1])[1]
+        self.output_message("Calculating trick winner...", level="DEBUG", source_id="Dealer")
         
         # Find highest card of lead suit
+        _, lead_suit = protocol.decode_card(self.current_trick[0][1])
         winner_idx = 0
         highest_value = 0
         
         for i, (player_id, card_byte) in enumerate(self.current_trick):
             value, suit = protocol.decode_card(card_byte)
-            # Convert face cards to numbers for comparison
             card_value = protocol.VALUES[value]
             
             if suit == lead_suit and card_value > highest_value:
@@ -934,261 +847,258 @@ class HeartsGame:
         winner_player = self.current_trick[winner_idx][0]
         self.trick_winner = winner_player
         
-        # Calculate points in trick
-        trick_points = 0
+        # Calculate points in this trick
+        trick_points = self._calculate_trick_points()
+        
+        # Log complete trick details
+        trick_cards = []
         for player_id, card_byte in self.current_trick:
-            value, suit = protocol.decode_card(card_byte)
-            if suit == "HEARTS":
-                trick_points += 1
-            elif suit == "SPADES" and value == "Q":
-                trick_points += 13
+            card_display = self._format_card_display(card_byte)
+            trick_cards.append(f"Player {player_id}: {card_display}")
         
-        self.output_message(f"[DEBUG] Player {winner_player} wins trick with {trick_points} points this trick.", level="DEBUG", source_id="Dealer")
+        self.log_game_event("TRICK_WINNER", 
+                          f"Trick {self.trick_count + 1} won by Player {winner_player} ({trick_points} points)",
+                          f"Cards: {', '.join(trick_cards)}")
         
-        # Track points won by this player (M0 only)
+        self.output_message(f"Player {winner_player} wins trick with {trick_points} points.", level="DEBUG", source_id="Dealer")
         self.trick_points_won[winner_player] += trick_points
         
-        # Send TRICK_SUMMARY
-        self.send_trick_summary(winner_player, trick_points)
+        # Send trick summary
+        self._send_trick_summary(winner_player, trick_points)
         
-        # Prepare for next trick
+        # Reset for next trick
         self.current_trick = []
         self.trick_count += 1
         self.is_first_trick = False
+        # CRITICAL RESET: Allow all players to play cards in the next trick
+        self.played_card_this_trick = False
         
-        # Give token to trick winner for next trick
-        if self.trick_count < 13:
-            time.sleep(1)  # Brief pause for readability
+        if self.trick_count < MAX_TRICKS_PER_HAND:
+            time.sleep(1)
             self.pass_token_to_player(winner_player)
         else:
-            self.output_message("[DEBUG] Hand complete! All 13 tricks played.", level="DEBUG", source_id="Dealer")
-            # Calculate hand summary and check for game over
-            time.sleep(2)  # Brief pause before summary
+            self.output_message("Hand complete!", level="DEBUG", source_id="Dealer")
+            time.sleep(2)
             self.calculate_hand_summary()
-    
-    def send_trick_summary(self, winner_id, points):
-        """Send TRICK_SUMMARY message (M0 only)."""
-        if not self.is_dealer or not self.network_node:
-            return
+
+    def _calculate_trick_points(self):
+        """Calculate points in the current trick."""
+        trick_points = 0
+        
+        for _, card_byte in self.current_trick:
+            value, suit = protocol.decode_card(card_byte)
             
-        # Create payload: winner_id + (player_id, card) pairs + points
-        # Format: [winner_id, p0, card0, p1, card1, p2, card2, p3, card3, points]
-        payload_data = [winner_id]
+            # Hearts are worth 1 point each
+            if suit == "HEARTS":
+                trick_points += 1
+            
+            # Queen of spades is worth 13 points
+            elif value == "Q" and suit == "SPADES":
+                trick_points += 13
+        
+        return trick_points
+
+    def _send_trick_summary(self, winner_player, trick_points):
+        """Send trick summary to all players."""
+        payload_data = [winner_player]
+        
         for player_id, card in self.current_trick:
             payload_data.extend([player_id, card])
-        payload_data.append(points)
         
-        payload = bytes(payload_data)
+        payload_data.append(trick_points)
         
-        seq = self.get_next_seq()
         self.network_node.send_message(
-            protocol.TRICK_SUMMARY,
-            self.player_id,
-            protocol.BROADCAST_ID,
-            seq,
-            payload
+            protocol.TRICK_SUMMARY, self.player_id, protocol.BROADCAST_ID, 
+            self.get_next_seq(), bytes(payload_data)
         )
-    
-    def pass_token_to_player(self, target_player):
-        """Pass token to specific player."""
-        if not self.network_node:
-            return
-            
-        self.has_token = False
-        payload = bytes([target_player])
-        seq = self.get_next_seq()
-        self.network_node.send_message(
-            protocol.TOKEN_PASS,
-            self.player_id,
-            protocol.BROADCAST_ID,
-            seq,
-            payload
-        )
-        identifier = "Dealer" if self.is_dealer else self.player_id
-        self.output_message(f"[DEBUG] Passed token to Player {target_player}", level="DEBUG", source_id=identifier)
-    
+
     def calculate_hand_summary(self):
-        """
-        Calculates hand summary scores (M0/Dealer only).
-        - Determines if any player "Shot the Moon" (STM) by collecting all 26 points.
-        - If the dealer (M0) is the STM achiever, M0 is prompted to choose the scoring outcome:
-            1. M0 scores 0 points, and all other players score 26 points.
-            2. M0 scores 26 points, and all other players score 0 (from the STM effect).
-        - If another player (not M0) achieves STM, standard STM scoring is applied: the shooter scores 0,
-          and all other players (including M0) score 26 points.
-        - If no player shoots the moon, scores are assigned based on points collected in tricks.
-        - Updates `self.hand_scores` and `self.total_scores`.
-        - Determines `shoot_moon_player_for_payload` for the HAND_SUMMARY message:
-            - ID of the shooter if standard STM (shooter gets 0).
-            - 0xFF if M0 takes 26 points (as it's not a standard STM benefit for M0 display-wise in payload).
-            - 0xFF if no STM.
-        - Calls `send_hand_summary` and then checks for game over or starts the next hand.
-        """
-        if not self.is_dealer: # This method is exclusively for the dealer (M0)
+        """Calculate and send hand summary with scores (dealer only)."""
+        if not self.is_dealer:
             return
             
-        self.output_message("="*60, level="INFO", timestamp=False)
-        self.output_message(f"📊 HAND {self.hand_number} SUMMARY", level="INFO", source_id="Dealer")
-        self.output_message("="*60, level="INFO", timestamp=False)
-
-        # Determine if any player collected all 26 points in this hand
-        shoot_moon_player_id = None
-        for p_id in range(4):
-            if self.trick_points_won[p_id] == 26: # 26 points means all hearts (13) and Q♠ (13)
-                shoot_moon_player_id = p_id
-                break
+        self.output_message("="*60 + f"\n📊 HAND {self.hand_number} SUMMARY\n" + "="*60, 
+                          level="INFO", source_id="Dealer", timestamp=False)
         
-        shoot_moon_player_for_payload = 0xFF # Initialize for HAND_SUMMARY payload (0xFF means no STM or M0 took points)
-
+        # Log hand scoring details
+        self.log_game_event("HAND_COMPLETE", f"Hand {self.hand_number} completed - calculating scores")
+        for player_id, points in enumerate(self.trick_points_won):
+            self.log_game_event("HAND_SCORE", f"Player {player_id} scored {points} points this hand")
+        
+        # Check for shooting the moon
+        shoot_moon_player_id = self._check_shoot_moon()
+        shoot_moon_payload = 0xFF
+        
         if shoot_moon_player_id is not None:
-            # A player has shot the moon.
-            if shoot_moon_player_id == self.player_id: # The Dealer (M0) shot the moon
-                self.output_message(f"🌙 You (Player {self.player_id}) SHOT THE MOON!", level="INFO", source_id="Dealer")
-                # M0 gets to choose the scoring outcome.
-                while True:
-                    # Direct input for interactive prompt with M0
-                    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                    prompt_message = ("Options:\\n"\
-                                      f"[{ts}] Dealer:   1. Score 0 points (others get 26 each).\\n"\
-                                      f"[{ts}] Dealer:   2. Score 26 points (others get 0 from STM).\\n"\
-                                      f"[{ts}] Dealer: Enter choice (1 or 2): ")
-                    choice = input(prompt_message)
-                    if choice == '1': # M0 chooses to give others 26 points
-                        self.output_message("Chose to score 0 points. Others get 26 each.", level="INFO", source_id="Dealer")
-                        self.hand_scores = [26, 26, 26, 26] # Assign 26 to everyone initially
-                        self.hand_scores[self.player_id] = 0  # M0 scores 0
-                        shoot_moon_player_for_payload = self.player_id # M0 is the shooter for payload
-                        break
-                    elif choice == '2': # M0 chooses to take 26 points for themself
-                        self.output_message("Chose to score 26 points. Others get 0 from STM effect.", level="INFO", source_id="Dealer")
-                        self.hand_scores = [0, 0, 0, 0]   # Assign 0 to everyone initially
-                        self.hand_scores[self.player_id] = 26 # M0 scores 26
-                        # shoot_moon_player_for_payload remains 0xFF, as this isn't the "standard" STM outcome
-                        # where the shooter benefits by getting 0 and is highlighted in the payload.
-                        # The actual scores will reflect M0 taking the points.
-                        break
-                    else:
-                        # Direct print for immediate feedback on invalid input
-                        self.output_message("[DEALER] Invalid choice. Please enter 1 or 2.", level="INFO", source_id="Dealer")
-            else: # Another player (not M0) shot the moon
-                self.output_message(f"🌙 SHOOTING THE MOON! Player {shoot_moon_player_id} got all 26 points!", level="INFO", source_id="Dealer")
-                # Standard STM scoring rule applies: shooter gets 0, others get 26.
-                self.hand_scores = [26, 26, 26, 26]
-                self.hand_scores[shoot_moon_player_id] = 0
-                shoot_moon_player_for_payload = shoot_moon_player_id
+            shoot_moon_payload = self._handle_shoot_moon(shoot_moon_player_id)
         else:
-            # No player shot the moon, scores are as accumulated
             self.hand_scores = self.trick_points_won.copy()
-            # shoot_moon_player_for_payload remains 0xFF
-
+        
         # Update total scores
         for player_id in range(4):
             self.total_scores[player_id] += self.hand_scores[player_id]
         
-        # Display hand results
-        self.output_message("Hand Points:", level="INFO", source_id="Dealer")
-        for player_id_score in range(4): # Renamed to avoid conflict
-            self.output_message(f"  Player {player_id_score}: {self.hand_scores[player_id_score]} points", level="INFO", timestamp=False)
+        # Log final scores
+        self.log_game_event("TOTAL_SCORES", f"Hand {self.hand_number} totals: " + 
+                          ", ".join([f"P{i}:{self.total_scores[i]}" for i in range(4)]))
         
-        self.output_message("\nTotal Scores:", level="INFO", source_id="Dealer", timestamp=False) # Start \n on new line
-        for player_id_score in range(4): # Renamed
-            self.output_message(f"  Player {player_id_score}: {self.total_scores[player_id_score]} points", level="INFO", timestamp=False)
+        self._display_hand_scores()
+        self._send_hand_summary(shoot_moon_payload)
         
-        # Send HAND_SUMMARY message
-        # shoot_moon_player_for_payload is determined by the STM logic above
-        self.send_hand_summary(shoot_moon_player_for_payload)
+        time.sleep(2)
         
-        # Check for game over (someone reached 100+ points)
-        time.sleep(2)  # Brief pause before checking game over
-        if max(self.total_scores) >= 100:
+        if max(self.total_scores) >= GAME_END_SCORE:
             self.calculate_game_over()
         else:
-            # print("\\n" + log_with_timestamp("Dealer", f"🎲 Starting Hand {self.hand_number + 1}...")) # Keep \\n for now
-            self.start_next_hand() # Call start_next_hand here
-    
-    def send_hand_summary(self, shoot_moon_player):
-        """Send HAND_SUMMARY message (M0 only)."""
-        if not self.is_dealer or not self.network_node:
-            return
-            
-        # Payload format: PONTOS_MAO_J0..J3 (4 bytes), PONTOS_ACUM_J0..J3 (4 bytes), SHOOT_MOON (1 byte)
-        payload_data = []
+            self.start_next_hand()
+
+    def _check_shoot_moon(self):
+        """Check if any player shot the moon."""
+        for player_id, score in enumerate(self.trick_points_won):
+            if score == SHOOT_MOON_POINTS:
+                return player_id
+        return None
+
+    def _handle_shoot_moon(self, shoot_moon_player_id):
+        """Handle shoot the moon scoring."""
+        self.log_game_event("SHOOT_MOON", f"Player {shoot_moon_player_id} shot the moon!")
         
-        # Hand points for each player (4 bytes)
-        payload_data.extend(self.hand_scores)
+        if shoot_moon_player_id == self.player_id:
+            self.output_message(f"🌙 You (Player {self.player_id}) SHOT THE MOON!", level="INFO", source_id="Dealer")
+            return self._get_shoot_moon_choice(shoot_moon_player_id)
+        else:
+            self.output_message(f"🌙 Player {shoot_moon_player_id} SHOT THE MOON!", level="INFO", source_id="Dealer")
+            self.hand_scores = [SHOOT_MOON_POINTS] * 4
+            self.hand_scores[shoot_moon_player_id] = 0
+            self.log_game_event("SHOOT_MOON_SCORING", 
+                              f"Applied shooting moon: Player {shoot_moon_player_id} gets 0, others get 26")
+            return shoot_moon_player_id
+
+    def _get_shoot_moon_choice(self, shoot_moon_player_id):
+        """Handle shoot the moon choice for the dealer when they shot the moon."""
+        if self.auto_mode:
+            # Auto mode: choose to subtract 26 from others
+            self.hand_scores = [SHOOT_MOON_POINTS] * 4
+            self.hand_scores[shoot_moon_player_id] = 0
+            self.log_game_event("SHOOT_MOON_SCORING", 
+                              f"Auto-mode: Player {shoot_moon_player_id} gets 0, others get 26")
+            return shoot_moon_player_id
         
-        # Total accumulated points for each player (4 bytes)
-        payload_data.extend(self.total_scores)
+        # Manual mode: ask for choice
+        timeout_input = TimeoutInput(INPUT_TIMEOUT)
         
-        # Shoot the moon indicator (1 byte)
-        shoot_moon_byte = shoot_moon_player if shoot_moon_player is not None else 0xFF
-        payload_data.append(shoot_moon_byte)
+        while True:
+            try:
+                self.output_message("🌙 You shot the moon! Choose your scoring:", level="INFO", source_id="Dealer")
+                self.output_message("  [1] Give 26 points to all other players (recommended)", level="INFO", timestamp=False)
+                self.output_message("  [2] Subtract 26 points from your total", level="INFO", timestamp=False)
+                
+                ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                prompt = f"[{ts}] Enter choice (1 or 2): "
+                
+                user_input = timeout_input.input_with_timeout(prompt)
+                if user_input is None:
+                    # Timeout - choose option 1 (safer choice)
+                    self.output_message("Input timeout - choosing option 1 (give points to others)", level="INFO")
+                    self.hand_scores = [SHOOT_MOON_POINTS] * 4
+                    self.hand_scores[shoot_moon_player_id] = 0
+                    self.log_game_event("SHOOT_MOON_SCORING", 
+                                      f"Timeout choice: Player {shoot_moon_player_id} gets 0, others get 26")
+                    return shoot_moon_player_id
+                
+                choice = int(user_input.strip())
+                
+                if choice == 1:
+                    # Give 26 points to all other players
+                    self.hand_scores = [SHOOT_MOON_POINTS] * 4
+                    self.hand_scores[shoot_moon_player_id] = 0
+                    self.output_message("Chose to give 26 points to all other players", level="INFO")
+                    self.log_game_event("SHOOT_MOON_SCORING", 
+                                      f"Manual choice 1: Player {shoot_moon_player_id} gets 0, others get 26")
+                    return shoot_moon_player_id
+                elif choice == 2:
+                    # Subtract 26 points from shooter's total
+                    self.hand_scores = [0, 0, 0, 0]
+                    self.hand_scores[shoot_moon_player_id] = -SHOOT_MOON_POINTS
+                    self.output_message("Chose to subtract 26 points from your total", level="INFO")
+                    self.log_game_event("SHOOT_MOON_SCORING", 
+                                      f"Manual choice 2: Player {shoot_moon_player_id} gets -26, others get 0")
+                    return shoot_moon_player_id
+                else:
+                    raise ValueError("Must choose 1 or 2")
+                    
+            except (ValueError, IndexError) as e:
+                self.output_message(f"Invalid choice: {e}. Please try again.", level="INFO")
+            except Exception as e:
+                self.output_message(f"Input error: {e}. Choosing option 1.", level="INFO")
+                self.hand_scores = [SHOOT_MOON_POINTS] * 4
+                self.hand_scores[shoot_moon_player_id] = 0
+                self.log_game_event("SHOOT_MOON_SCORING", 
+                                  f"Exception fallback: Player {shoot_moon_player_id} gets 0, others get 26")
+                return shoot_moon_player_id
+
+    def _display_hand_scores(self):
+        """Display the scores for this hand and total scores."""
+        self.output_message("Hand Points:", level="INFO", source_id="Dealer")
+        for player_id, score in enumerate(self.hand_scores):
+            self.output_message(f"  Player {player_id}: {score} points", level="INFO", timestamp=False)
         
-        payload = bytes(payload_data)
-        
-        seq = self.get_next_seq()
+        self.output_message("\nTotal Scores:", level="INFO", source_id="Dealer", timestamp=False)
+        for player_id, score in enumerate(self.total_scores):
+            self.output_message(f"  Player {player_id}: {score} points", level="INFO", timestamp=False)
+
+    def _send_hand_summary(self, shoot_moon_payload):
+        """Send hand summary message to all players."""
+        payload = bytes(self.hand_scores + self.total_scores + [shoot_moon_payload])
         self.network_node.send_message(
-            protocol.HAND_SUMMARY,
-            self.player_id,
-            protocol.BROADCAST_ID,
-            seq,
-            payload
+            protocol.HAND_SUMMARY, self.player_id, protocol.BROADCAST_ID, 
+            self.get_next_seq(), payload
         )
-        self.output_message("[DEBUG] Sent HAND_SUMMARY to all players", level="DEBUG", source_id="Dealer")
-    
+        self.output_message("Sent HAND_SUMMARY", level="DEBUG", source_id="Dealer")
+
     def calculate_game_over(self):
-        """Calculate game winner and send GAME_OVER (M0 only)."""
+        """Calculate and send game over message (dealer only)."""
         if not self.is_dealer:
             return
             
-        self.output_message("="*60, level="INFO", timestamp=False)
-        self.output_message("🎯 GAME OVER!", level="INFO", source_id="Dealer")
-        self.output_message("="*60, level="INFO", timestamp=False)
+        self.output_message("="*60 + "\n🎯 GAME OVER!\n" + "="*60, 
+                          level="INFO", source_id="Dealer", timestamp=False)
         
-        # Find winner (lowest score)
         min_score = min(self.total_scores)
         winner_id = self.total_scores.index(min_score)
         
+        # Log game completion
+        final_scores_str = ", ".join([f"Player {i}: {score}" for i, score in enumerate(self.total_scores)])
+        self.log_game_event("GAME_OVER", f"Game completed - Winner: Player {winner_id} with {min_score} points")
+        self.log_game_event("FINAL_SCORES", final_scores_str)
+        
         self.output_message("Final Scores:", level="INFO", source_id="Dealer")
-        for p_id in range(4): # Renamed to avoid conflict
-            status = " 🏆 WINNER!" if p_id == winner_id else ""
-            self.output_message(f"  Player {p_id}: {self.total_scores[p_id]} points{status}", level="INFO", timestamp=False)
+        for player_id, score in enumerate(self.total_scores):
+            status = " 🏆 WINNER!" if player_id == winner_id else ""
+            self.output_message(f"  Player {player_id}: {score} points{status}", level="INFO", timestamp=False)
         
-        self.output_message(f"🎉 Player {winner_id} wins with {min_score} points!", level="INFO", source_id="Dealer", timestamp=True) # Timestamp this one
+        self.output_message(f"🎉 Player {winner_id} wins with {min_score} points!", level="INFO", source_id="Dealer")
         
-        # Send GAME_OVER message
-        self.send_game_over(winner_id)
-        
-        # Mark game as over
-        self.game_over = True
-    
-    def send_game_over(self, winner_id):
-        """Send GAME_OVER message (M0 only)."""
-        if not self.is_dealer or not self.network_node:
-            return
-            
-        # Payload format: ID_VENCEDOR (1 byte), PONTOS_FINAIS_J0..J3 (4 bytes)
-        payload_data = [winner_id]
-        payload_data.extend(self.total_scores)
-        
-        payload = bytes(payload_data)
-        
-        seq = self.get_next_seq()
+        payload = bytes([winner_id] + self.total_scores)
         self.network_node.send_message(
-            protocol.GAME_OVER,
-            self.player_id,
-            protocol.BROADCAST_ID,
-            seq,
-            payload
+            protocol.GAME_OVER, self.player_id, protocol.BROADCAST_ID, 
+            self.get_next_seq(), payload
         )
-        self.output_message("[DEBUG] Sent GAME_OVER to all players", level="DEBUG", source_id="Dealer")
-    
+        self.output_message("Sent GAME_OVER", level="DEBUG", source_id="Dealer")
+        self.game_over = True
+        
+        # Close log file
+        if self.log_file:
+            self.log_file.write(f"\nGame completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            self.log_file.write("="*80 + "\n")
+            self.log_file.close()
+            self.output_message("Game log file closed", level="INFO", source_id="Dealer")
+
     def start_next_hand(self):
-        """Start the next hand with rotated pass direction (M0 only)."""
+        """Start the next hand (dealer only)."""
         if not self.is_dealer:
             return
             
-        # Reset hand state
         self.hand_number += 1
         self.trick_count = 0
         self.is_first_trick = True
@@ -1197,184 +1107,378 @@ class HeartsGame:
         self.pass_cards_received = set()
         self.passing_complete = False
         self.cards_passed = False
-        self.has_token = True  # M0 starts with token again
+        self.has_token = True
         
-        # Rotate pass direction: LEFT -> RIGHT -> ACROSS -> NONE -> repeat
-        pass_cycle = [protocol.PASS_LEFT, protocol.PASS_RIGHT, protocol.PASS_ACROSS, protocol.PASS_NONE]
-        self.pass_direction = pass_cycle[(self.hand_number - 1) % 4]
+        # Cycle through pass directions
+        pass_directions = [protocol.PASS_LEFT, protocol.PASS_RIGHT, protocol.PASS_ACROSS, protocol.PASS_NONE]
+        self.pass_direction = pass_directions[(self.hand_number - 1) % 4]
         
-        # This is where the new hand header will be printed by deal_cards for all players
-        # For M0, it can also log its specific action of starting the hand.
-        self.output_message(f"[DEBUG] Dealer initiating Hand {self.hand_number}", level="DEBUG", source_id="Dealer")
-
+        self.output_message(f"Dealer initiating Hand {self.hand_number}", level="DEBUG", source_id="Dealer")
+        
         def delayed_new_hand():
             time.sleep(3)
-            self.deal_cards() # This will print the "HAND X" header for M0 too
+            self.deal_cards()
             time.sleep(1)
             
-            # Skip passing phase if it's a "no pass" hand
             if self.pass_direction == protocol.PASS_NONE:
-                self.output_message("[DEBUG] No passing this hand - going straight to tricks", level="DEBUG", source_id="Dealer")
+                self.output_message("No passing this hand", level="DEBUG", source_id="Dealer")
                 self.start_tricks_phase()
             else:
                 self.start_passing_phase()
         
         threading.Thread(target=delayed_new_hand, daemon=True).start()
-    
-    def handle_hand_summary(self, header, payload):
-        """Handle HAND_SUMMARY message."""
-        clear_screen()
-        if len(payload) < 9:  # 4 + 4 + 1 minimum
+
+    # ============================================================================
+    # MESSAGE HANDLERS
+    # ============================================================================
+
+    def handle_game_start(self, header, payload):
+        """Handle GAME_START message."""
+        self.clear_screen()
+        self.game_started = True
+        self.output_message("Game started!", level="INFO")
+
+    def handle_deal_hand(self, header, payload):
+        """Handle DEAL_HAND message."""
+        self.clear_screen()
+        if len(payload) != CARDS_PER_HAND:
+            self.output_message(f"Invalid hand size: {len(payload)}", level="DEBUG")
             return
             
-        # Parse payload: hand_points (4) + total_points (4) + shoot_moon (1)
+        self.output_message(f"==================== HAND {self.hand_number} ====================", 
+                          level="INFO", timestamp=False)
+        
+        self.hand = list(payload)
+        self.cards_received = True
+        self.output_message(f"Received {len(self.hand)} cards for a new hand", level="INFO")
+        self.display_hand()
+        
+        # Reset hand state
+        self.is_first_trick = True
+        self.hearts_broken = False
+        if hasattr(self, '_hearts_broken_announced'):
+            del self._hearts_broken_announced
+        self.current_trick = []
+        
+        if not self.is_dealer and hasattr(self, 'local_trick_display_count'):
+            self.local_trick_display_count = 0
+
+    def handle_start_phase(self, header, payload):
+        """Handle START_PHASE message."""
+        self.clear_screen()
+        if len(payload) < 1:
+            return
+            
+        phase = payload[0]
+        self.current_phase = phase
+        
+        if phase == protocol.PHASE_PASSING and len(payload) >= 2:
+            self.pass_direction = payload[1]
+            direction_name = PASS_DIRECTION_NAMES.get(self.pass_direction, 'UNKNOWN')
+            self.output_message(f"Passing phase started - direction: {direction_name}", level="INFO")
+        elif phase == protocol.PHASE_TRICKS:
+            self.output_message("Tricks phase started!", level="INFO")
+            self.cards_passed = False
+            self.cards_to_pass = []
+
+    def handle_token_pass(self, header, payload):
+        """Handle TOKEN_PASS message."""
+        if len(payload) < 1 or payload[0] != self.player_id:
+            self.has_token = False
+            return
+            
+        self.has_token = True
+        self.output_message("Received token!", level="DEBUG")
+        
+        if self.current_phase == protocol.PHASE_PASSING and not self.cards_passed and len(self.hand) >= CARDS_TO_PASS:
+            self._handle_passing_turn()
+        elif self.current_phase == protocol.PHASE_TRICKS:
+            self._handle_tricks_turn()
+
+    def _handle_passing_turn(self):
+        """Handle token during passing phase."""
+        if self.pass_direction == protocol.PASS_NONE:
+            self.output_message("No passing this round. Passing token.", level="INFO")
+            self.pass_token_to_player((self.player_id + 1) % 4)
+            return
+        
+        self.output_message(f"--- Your Turn (Player {self.player_id}) to Pass ---", level="INFO", timestamp=False)
+        self.display_hand()
+        self._get_cards_to_pass_from_user()
+
+    def _handle_tricks_turn(self):
+        """Handle token during tricks phase."""
+        two_clubs = protocol.encode_card("2", "CLUBS")
+        
+        if self.is_first_trick and len(self.current_trick) == 0:
+            if two_clubs in self.hand:
+                if not self.is_dealer:
+                    self.output_message("I have 2♣! Starting first trick", level="INFO")
+                self.initiate_card_play()
+            else:
+                if not self.is_dealer:
+                    self.output_message("Don't have 2♣, passing token", level="DEBUG")
+                self.pass_token_to_player((self.player_id + 1) % 4)
+        else:
+            self.initiate_card_play()
+
+    def handle_play_card(self, header, payload):
+        """Handle PLAY_CARD message."""
+        if len(payload) != 1:
+            return
+            
+        card_byte = payload[0]
+        origin_id = header["origin_id"]
+        
+        self.current_trick.append((origin_id, card_byte))
+        
+        try:
+            value, suit = protocol.decode_card(card_byte)
+            card_display = self._format_card_display(card_byte)
+            self.output_message(f"→ Player {origin_id} played {card_display}", level="INFO")
+            
+            # Log the card play event
+            self.log_game_event("CARD_PLAYED", 
+                              f"Player {origin_id} played {card_display} (Trick {self.trick_count + 1}, Position {len(self.current_trick)})")
+            
+            if suit == "HEARTS" and not self.hearts_broken:
+                self.hearts_broken = True
+                self.output_message("💔 Hearts have been broken!", level="INFO")
+                self.log_game_event("HEARTS_BROKEN", f"Hearts broken by Player {origin_id} playing {card_display}")
+        except Exception as e:
+            self.output_message(f"→ Player {origin_id} played card (decode error: {e})", level="DEBUG")
+            self.log_game_event("CARD_PLAYED", f"Player {origin_id} played unknown card (decode error)")
+        
+        self.output_message(f"Trick progress: {len(self.current_trick)}/4 cards played", level="DEBUG")
+        
+        if len(self.current_trick) < 4:
+            if origin_id == self.player_id and self.has_token:
+                self.pass_token_to_player((self.player_id + 1) % 4)
+        elif self.is_dealer:
+            self.calculate_trick_winner()
+
+    def handle_trick_summary(self, header, payload):
+        """Handle TRICK_SUMMARY message."""
+        if len(payload) < 10:
+            return
+            
+        winner_id = payload[0]
+        trick_points = payload[-1]
+        
+        if not hasattr(self, 'local_trick_display_count'):
+            self.local_trick_display_count = 0
+        
+        self.local_trick_display_count += 1
+        local_count = min(self.local_trick_display_count, MAX_TRICKS_PER_HAND)
+        
+        self.output_message(f"--- Trick Summary (Trick {local_count}/{MAX_TRICKS_PER_HAND}) ---", 
+                          level="INFO", timestamp=False)
+        self.output_message(f"🏆 Player {winner_id} wins trick {local_count}/{MAX_TRICKS_PER_HAND} with {trick_points} points", 
+                          level="INFO")
+        
+        self.output_message("Cards played this trick:", level="INFO")
+        for i in range(4):
+            player_id = payload[1 + i * 2]
+            card_byte = payload[2 + i * 2]
+            
+            try:
+                card_display = self._format_card_display(card_byte)
+                self.output_message(f"  Player {player_id}: {card_display}", level="INFO", timestamp=False)
+            except:
+                self.output_message(f"  Player {player_id}: [card decode error]", level="DEBUG", timestamp=False)
+        
+        self.current_trick = []
+        self.is_first_trick = False
+        # CRITICAL RESET: Allow player to play card in the next trick
+        self.played_card_this_trick = False
+        self.output_message("="*40, level="INFO", timestamp=False)
+
+    def handle_hand_summary(self, header, payload):
+        """Handle HAND_SUMMARY message."""
+        self.clear_screen()
+        if len(payload) < 9:
+            return
+            
         hand_points = list(payload[0:4])
         total_points = list(payload[4:8])
         shoot_moon_byte = payload[8]
         
-        # Update local scores
         self.hand_scores = hand_points
         self.total_scores = total_points
         
-        self.output_message("="*60, level="INFO", timestamp=False)
-        self.output_message(f"📊 HAND SUMMARY (view)", level="INFO")
-        self.output_message("="*60, level="INFO", timestamp=False)
+        self.output_message("="*60 + "\n📊 HAND SUMMARY (view)\n" + "="*60, 
+                          level="INFO", timestamp=False)
         
         if shoot_moon_byte != 0xFF:
             self.output_message(f"🌙 Player {shoot_moon_byte} SHOT THE MOON!", level="INFO")
         
         self.output_message("Hand Points:", level="INFO")
-        for p_id in range(4): # Renamed
-            self.output_message(f"  Player {p_id}: {hand_points[p_id]} points", level="INFO", timestamp=False)
+        for player_id, score in enumerate(hand_points):
+            self.output_message(f"  Player {player_id}: {score} points", level="INFO", timestamp=False)
         
         self.output_message("Total Scores:", level="INFO")
-        for p_id in range(4): # Renamed
-            self.output_message(f"  Player {p_id}: {total_points[p_id]} points", level="INFO", timestamp=False)
+        for player_id, score in enumerate(total_points):
+            self.output_message(f"  Player {player_id}: {score} points", level="INFO", timestamp=False)
         
         self.output_message("  " + "="*40, level="INFO", timestamp=False)
-    
+
     def handle_game_over(self, header, payload):
         """Handle GAME_OVER message."""
-        clear_screen()
+        self.clear_screen()
         if len(payload) < 5:
             return
             
         winner_id = payload[0]
         final_scores = list(payload[1:5])
         
-        self.output_message("="*60, level="INFO", timestamp=False)
-        self.output_message("🎯 GAME OVER (results received)", level="INFO")
-        self.output_message("="*60, level="INFO", timestamp=False)
+        self.output_message("="*60 + "\n🎯 GAME OVER (results received)\n" + "="*60, 
+                          level="INFO", timestamp=False)
         
-        for p_id in range(4): # Renamed
-            status = " 🏆 WINNER!" if p_id == winner_id else ""
-            self.output_message(f"  Player {p_id}: {final_scores[p_id]} points{status}", level="INFO", timestamp=False)
+        for player_id, score in enumerate(final_scores):
+            status = " 🏆 WINNER!" if player_id == winner_id else ""
+            self.output_message(f"  Player {player_id}: {score} points{status}", level="INFO", timestamp=False)
         
         self.game_over = True
         self.output_message("Game over - final scores received", level="INFO")
-    
+
     def handle_pass_cards(self, header, payload):
-        """Handle PASS_CARDS message - receive cards from another player."""
-        if len(payload) != 3:
-            self.output_message(f"[DEBUG] Invalid PASS_CARDS payload size: {len(payload)}", level="DEBUG")
+        """Handle PASS_CARDS message."""
+        if len(payload) != CARDS_TO_PASS:
             return
             
-        origin_id = header["origin_id"]
-        dest_id = header["dest_id"]
-        
-        # Only process if this message is for us
-        if dest_id == self.player_id:
-            # Add the received cards to our hand
+        # Log card passing event
+        try:
+            passed_cards = [self._format_card_display(c) for c in payload]
+            self.log_game_event("CARDS_PASSED", 
+                              f"Player {header['origin_id']} passed to Player {header['dest_id']}: {' '.join(passed_cards)}")
+        except Exception as e:
+            self.log_game_event("CARDS_PASSED", 
+                              f"Player {header['origin_id']} passed 3 cards to Player {header['dest_id']} (display error)")
+            
+        # If cards are for this player, add them to hand
+        if header["dest_id"] == self.player_id:
             received_cards = list(payload)
             self.hand.extend(received_cards)
+            self.output_message(f"Received 3 cards from Player {header['origin_id']}", level="INFO")
             
-            self.output_message(f"Received 3 cards from Player {origin_id}", level="INFO")
             try:
-                cards_str = []
-                for card_byte_rcv in received_cards: # Renamed
-                    value, suit = protocol.decode_card(card_byte_rcv)
-                    suit_symbol = {"DIAMONDS": "♦", "CLUBS": "♣", "HEARTS": "♥", "SPADES": "♠"}
-                    cards_str.append(f"{value}{suit_symbol[suit]}")
+                cards_str = [self._format_card_display(c) for c in received_cards]
                 self.output_message(f"  Received: {' '.join(cards_str)}", level="INFO", timestamp=False)
             except Exception as e:
-                self.output_message(f"  [DEBUG] (Card display error: {e})", level="DEBUG", timestamp=False)
+                self.output_message(f"  (Card display error: {e})", level="DEBUG", timestamp=False)
             
             self.display_hand()
         
-        # If dealer, track passing completion
+        # Dealer tracks all pass cards messages for synchronization
         if self.is_dealer:
-            if origin_id not in self.pass_cards_received:
-                self.pass_cards_received.add(origin_id)
-                self.output_message(f"[DEBUG] Recorded PASS_CARDS from Player {origin_id} ({len(self.pass_cards_received)}/4 complete)", level="DEBUG", source_id="Dealer")
+            if header["origin_id"] not in self.pass_cards_received:
+                self.pass_cards_received.add(header["origin_id"])
+                self.output_message(f"Recorded PASS_CARDS from Player {header['origin_id']} ({len(self.pass_cards_received)}/4)", 
+                                  level="DEBUG", source_id="Dealer")
                 
                 if len(self.pass_cards_received) >= 4:
-                    self.output_message("[DEBUG] All players have passed cards - starting tricks phase", level="DEBUG", source_id="Dealer")
+                    self.log_game_event("PASSING_COMPLETE", f"All 4 players have passed cards")
+                    self.output_message("All players passed - starting tricks", level="DEBUG", source_id="Dealer")
                     time.sleep(1)
                     self.start_tricks_phase()
-    
+
+    # ============================================================================
+    # MAIN GAME LOOP
+    # ============================================================================
+
     def process_messages(self):
-        """Main message processing loop."""
-        self.output_message("[DEBUG] Ready and waiting for messages...", level="DEBUG")
+        """Main message processing loop with timeout monitoring."""
+        self.output_message("Ready and waiting for messages...", level="DEBUG")
         
-        # If dealer, start the game after a short delay
         if self.is_dealer:
-            def delayed_start():
-                time.sleep(2)
-                self.start_game()
-            threading.Thread(target=delayed_start, daemon=True).start()
+            threading.Thread(target=lambda: (time.sleep(2), self.start_game()), daemon=True).start()
+        
+        # Timeout monitoring variables
+        last_activity = time.time()
+        last_token_time = time.time() if self.has_token else None
+        no_activity_warned = False
         
         try:
-            while True:
+            while not self.game_over:
                 try:
-                    header, payload, source_addr = self.message_queue.get(timeout=1.0)
-                    
+                    header, payload, _ = self.message_queue.get(timeout=1.0)
                     msg_type = header["type"]
-                    origin_id = header["origin_id"]
+                    origin_id = header["origin_id"];
                     
-                    self.output_message(f"[DEBUG] Received {protocol.get_message_type_name(msg_type)} from Player {origin_id}", level="DEBUG")
+                    # Reset timeout monitoring on any message
+                    last_activity = time.time()
+                    no_activity_warned = False
                     
-                    # Handle different message types
-                    if msg_type == protocol.GAME_START:
-                        self.handle_game_start(header, payload)
-                    elif msg_type == protocol.DEAL_HAND:
-                        self.handle_deal_hand(header, payload)
-                    elif msg_type == protocol.START_PHASE:
-                        self.handle_start_phase(header, payload)
-                    elif msg_type == protocol.TOKEN_PASS:
-                        self.handle_token_pass(header, payload)
-                    elif msg_type == protocol.PASS_CARDS:
-                        self.handle_pass_cards(header, payload)
-                    elif msg_type == protocol.PLAY_CARD:
-                        self.handle_play_card(header, payload)
-                    elif msg_type == protocol.TRICK_SUMMARY:
-                        self.handle_trick_summary(header, payload)
-                    elif msg_type == protocol.HAND_SUMMARY:
-                        self.handle_hand_summary(header, payload)
-                    elif msg_type == protocol.GAME_OVER:
-                        self.handle_game_over(header, payload)
+                    self.output_message(f"RCV {protocol.get_message_type_name(msg_type)} from {origin_id}", level="DEBUG")
+                    
+                    handler = self.message_handlers.get(msg_type)
+                    if handler:
+                        handler(header, payload)
                     else:
-                        self.output_message(f"[DEBUG] Unhandled message type: {protocol.get_message_type_name(msg_type)}", level="DEBUG")
-                
+                        self.output_message(f"Unhandled msg type: {msg_type}", level="DEBUG")
+                        
                 except queue.Empty:
+                    current_time = time.time()
+                    
+                    # Check for general game timeout
+                    if current_time - last_activity > GAME_TIMEOUT:
+                        self.output_message(f"Game timeout ({GAME_TIMEOUT}s) - forcing game end", level="INFO")
+                        self.game_over = True
+                        break
+                    
+                    # Check for token timeout
+                    if self.has_token and last_token_time and current_time - last_token_time > TOKEN_TIMEOUT:
+                        self.output_message(f"Token held too long ({TOKEN_TIMEOUT}s) - auto-passing token", level="INFO")
+                        self._handle_token_timeout()
+                        last_token_time = current_time
+                    
+                    # Warning for no activity
+                    if current_time - last_activity > 30 and not no_activity_warned:
+                        self.output_message(f"No activity for {int(current_time - last_activity)}s - game may be stuck", level="INFO")
+                        no_activity_warned = True
+                    
+                    # Update token timing
+                    if self.has_token and not last_token_time:
+                        last_token_time = current_time
+                    elif not self.has_token:
+                        last_token_time = None
+                    
                     continue
                     
         except KeyboardInterrupt:
-            self.output_message("[DEBUG] Shutting down...", level="DEBUG")
+            self.output_message("Shutting down...", level="DEBUG")
         finally:
             if self.network_node:
                 self.network_node.stop()
 
-def main():
-    parser = argparse.ArgumentParser(description="Hearts Game Client")
-    parser.add_argument("player_id", type=int, choices=[0, 1, 2, 3], 
-                       help="Player ID (0-3, where 0 is the dealer)")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                       help="Enable verbose debug logging")
-    args = parser.parse_args()
-    
-    game = HeartsGame(args.player_id, args.verbose)
-    game.start_network()
-    game.process_messages()
-
-if __name__ == "__main__":
-    main()
+    def _handle_token_timeout(self):
+        """Handle timeout when holding token too long."""
+        if not self.has_token:
+            return
+            
+        if self.current_phase == protocol.PHASE_PASSING and not self.cards_passed:
+            self.output_message("Token timeout during passing - auto-selecting cards", level="INFO")
+            if len(self.hand) >= CARDS_TO_PASS:
+                self.cards_to_pass = self.hand[:CARDS_TO_PASS]
+                self.pass_selected_cards()
+            else:
+                self.cards_to_pass = []
+                self.pass_selected_cards()
+        elif self.current_phase == protocol.PHASE_TRICKS:
+            self.output_message("Token timeout during tricks - auto-playing card", level="INFO")
+            valid_cards = self.get_valid_plays()
+            if valid_cards:
+                card_to_play = valid_cards[0]
+                card_display = self._format_card_display(card_to_play)
+                self.output_message(f"Auto-selected card due to timeout: {card_display}", level="INFO")
+                self.play_card(card_to_play)
+            elif self.hand:
+                # Fallback: play any card if no valid cards found
+                card_to_play = self.hand[0]
+                card_display = self._format_card_display(card_to_play)
+                self.output_message(f"Emergency fallback - playing first card: {card_display}", level="INFO")
+                self.play_card(card_to_play)
+        else:
+            # Unknown state, just pass the token
+            self.output_message("Token timeout in unknown state - passing token", level="INFO")
+            self.pass_token_to_player((self.player_id + 1) % 4)

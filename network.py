@@ -34,14 +34,16 @@ class NetworkNode:
         self._log("INFO", f"Listening on {self.my_address}")
 
     def _listen(self):
+        message_count = 0
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(1024) # Buffer size
-                self._log("DEBUG", f"Received raw data from {addr}: {data.hex()}") # Log raw data in hex for readability
+                message_count += 1
+                self._log("DEBUG", f"Received raw data #{message_count} from {addr}: {data.hex()}") # Log raw data in hex for readability
                 header, payload = parse_message(data)
                 
                 if header:
-                    self._log("DEBUG", f"Parsed message: {header}")
+                    self._log("DEBUG", f"Parsed message #{message_count}: Type:{header['type']} Origin:{header['origin_id']} Dest:{header['dest_id']} Seq:{header['seq_num']}")
                     
                     # Special case: M0 (dealer) monitors all PASS_CARDS messages for synchronization
                     should_process = (header["dest_id"] == self.my_id or 
@@ -49,22 +51,26 @@ class NetworkNode:
                                     (self.my_id == 0 and header["type"] == 0x05))  # 0x05 = PASS_CARDS
                     
                     if should_process:
+                        self._log("DEBUG", f"Message #{message_count} queued for processing (matches dest or broadcast)")
                         self.message_queue.put((header, payload, addr))
+                    else:
+                        self._log("DEBUG", f"Message #{message_count} not for this node (dest:{header['dest_id']}, my_id:{self.my_id})")
                     
                     # If message is not from this node originally, forward it
                     if header["origin_id"] != self.my_id:
+                        self._log("DEBUG", f"Forwarding message #{message_count} to next node {self.next_node_address}")
                         self.send_message_raw(data, self.next_node_address)
                     else:
                         # Message completed the loop and returned to origin
-                        self._log("DEBUG", f"Message {header['seq_num']} (Type: {header['type']}) from self completed loop.")
+                        self._log("DEBUG", f"Message #{message_count} (Type: {header['type']}) from self completed loop - not forwarding")
                         pass # Or handle confirmation if needed
                 else:
-                    self._log("ERROR", f"Received invalid/unparseable message from {addr}. Data: {data.hex()}")
+                    self._log("ERROR", f"Received invalid/unparseable message #{message_count} from {addr}. Data: {data.hex()}")
 
             except socket.timeout:
                 continue # Just to allow checking self.running periodically if a timeout is set
             except Exception as e:
-                self._log("ERROR", f"Listening error: {e}")
+                self._log("ERROR", f"Listening error after {message_count} messages: {e}")
                 if self.running: # Avoid printing errors if we are shutting down
                     time.sleep(0.1) # Avoid busy-looping on persistent errors
 

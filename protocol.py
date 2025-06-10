@@ -61,8 +61,18 @@ def decode_card(card_byte):
     value = card_byte & 0x0F
     suit = (card_byte >> 4) & 0x03
     
-    value_str = [k for k, v in VALUES.items() if v == value][0]
-    suit_str = [k for k, v in SUITS.items() if v == suit][0]
+    # Find value string - handle invalid values
+    value_matches = [k for k, v in VALUES.items() if v == value]
+    if not value_matches:
+        raise ValueError(f"Invalid card value: {value} (from byte {card_byte:02x})")
+    value_str = value_matches[0]
+    
+    # Find suit string - handle invalid suits
+    suit_matches = [k for k, v in SUITS.items() if v == suit]
+    if not suit_matches:
+        raise ValueError(f"Invalid card suit: {suit} (from byte {card_byte:02x})")
+    suit_str = suit_matches[0]
+    
     return value_str, suit_str
 
 # Message Structure (from Especificação.md Section 3)
