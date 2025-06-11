@@ -863,8 +863,11 @@ class HeartsGame:
         self.output_message(f"Player {winner_player} wins trick with {trick_points} points.", level="DEBUG", source_id="Dealer")
         self.trick_points_won[winner_player] += trick_points
         
-        # Send trick summary
+        # Send trick summary BEFORE resetting state
         self._send_trick_summary(winner_player, trick_points)
+        
+        # CRITICAL: Give time for trick summary to be processed by all players
+        time.sleep(0.5)
         
         # Reset for next trick
         self.current_trick = []
@@ -874,7 +877,7 @@ class HeartsGame:
         self.played_card_this_trick = False
         
         if self.trick_count < MAX_TRICKS_PER_HAND:
-            time.sleep(1)
+            time.sleep(0.5)
             self.pass_token_to_player(winner_player)
         else:
             self.output_message("Hand complete!", level="DEBUG", source_id="Dealer")
