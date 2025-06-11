@@ -5,29 +5,29 @@ echo "🎴 Starting Hearts Game in Auto-Debug Mode 🎴"
 echo "=============================================="
 
 # Kill any existing instances
-pkill -f "python main.py" 2>/dev/null
+pkill -f "python launcher.py" 2>/dev/null
 
 # Start all 4 players in auto mode with debug logging
 echo "Starting Player 3..."
-python main.py 3  &
+python launcher.py 3 --auto &
 P3_PID=$!
 
 sleep 0.5
 
 echo "Starting Player 2..."
-python main.py 2  &
+python launcher.py 2 --auto &
 P2_PID=$!
 
 sleep 0.5
 
 echo "Starting Player 1..."
-python main.py 1  &
+python launcher.py 1 --auto &
 P1_PID=$!
 
 sleep 0.5
 
 echo "Starting Player 0 (Coordinator)..."
-python main.py 0  &
+python launcher.py 0 --auto &
 P0_PID=$!
 
 echo ""
