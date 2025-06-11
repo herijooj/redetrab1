@@ -509,21 +509,16 @@ class HeartsGame:
         # Increased delay for phase transition
         time.sleep(0.8)
         
-        # Find who has 2 of clubs and give them the token
-        two_clubs = protocol.encode_card("2", "CLUBS")
-        if two_clubs in self.hand:
-            self.output_message(f"Player {self.player_id} (self) has 2♣ - starting", level="DEBUG", source_id="Dealer")
-            self.two_clubs_holder = self.player_id
-            self.log_game_event("TOKEN_PASS", f"Dealer has 2♣, keeping token to start first trick")
-            self.has_token = True
-            # Add delay before starting card play
-            time.sleep(0.3)
-            self.initiate_card_play()
-        else:
-            self.output_message("2♣ not in hand - checking others...", level="DEBUG", source_id="Dealer")
-            # Add delay before token passing
-            time.sleep(0.3)
-            self.pass_token_to_player(1)
+        # FIXED: Always start by passing token to Player 0 and let it circulate
+        # systematically until it reaches the player with 2♣
+        # This prevents multiple players thinking they should play simultaneously
+        self.output_message("Finding player with 2♣...", level="DEBUG", source_id="Dealer")
+        self.log_game_event("TOKEN_SEARCH", "Dealer starting systematic search for 2♣ holder")
+        
+        # Clear dealer's token state and start circulation from Player 0
+        self.has_token = False
+        time.sleep(0.3)
+        self.pass_token_to_player(0)
 
     def initiate_card_play(self):
         """Start card play for the current player."""
@@ -872,28 +867,30 @@ class HeartsGame:
         # Calculate points in this trick
         trick_points = self._calculate_trick_points()
         
-        # Log complete trick details
+        # Log complete trick details - use current trick number (before increment)
         trick_cards = []
         for player_id, card_byte in self.current_trick:
             card_display = self._format_card_display(card_byte)
             trick_cards.append(f"Player {player_id}: {card_display}")
         
+        # Display trick number consistently with other players (current trick, not next)
+        current_trick_display = self.trick_count + 1
         self.log_game_event("TRICK_WINNER", 
-                          f"Trick {self.trick_count + 1} won by Player {winner_player} ({trick_points} points)",
+                          f"Trick {current_trick_display} won by Player {winner_player} ({trick_points} points)",
                           f"Cards: {', '.join(trick_cards)}")
         
-        self.output_message(f"Player {winner_player} wins trick with {trick_points} points.", level="DEBUG", source_id="Dealer")
+        self.output_message(f"Player {winner_player} wins trick {current_trick_display} with {trick_points} points.", level="DEBUG", source_id="Dealer")
         self.trick_points_won[winner_player] += trick_points
         
-        # Send trick summary BEFORE resetting state
-        self._send_trick_summary(winner_player, trick_points)
+        # Send trick summary BEFORE updating trick count
+        self._send_trick_summary(winner_player, trick_points, current_trick_display)
         
         # CRITICAL: Give time for trick summary to be processed by all players
         time.sleep(0.5)
         
-        # Reset for next trick
+        # Reset for next trick - NOW increment trick count
         self.current_trick = []
-        self.trick_count += 1
+        self.trick_count += 1  # Moved AFTER trick summary is sent
         self.is_first_trick = False
         # CRITICAL RESET: Allow all players to play cards in the next trick
         self.played_card_this_trick = False
@@ -923,7 +920,7 @@ class HeartsGame:
         
         return trick_points
 
-    def _send_trick_summary(self, winner_player, trick_points):
+    def _send_trick_summary(self, winner_player, trick_points, current_trick_display):
         """Send trick summary to all players."""
         payload_data = [winner_player]
         
