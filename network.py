@@ -78,13 +78,33 @@ class NetworkNode:
         message = create_message(msg_type, origin_id, dest_id, seq_num, payload)
         # Log before sending, as send_message_raw is also used for forwarding
         self._log("DEBUG", f"Sending message to {self.next_node_address}: Type {msg_type}, Dest {dest_id}, Seq {seq_num}, Payload: {payload.hex()}")
+        
+        # CRITICAL FIX: Handle self-delivery and broadcast messages properly
+        # When sending to self or broadcast, ensure we process the message locally too
+        if dest_id == self.my_id or dest_id == 0xFF:
+            self._log("DEBUG", f"Message for self/broadcast - processing locally before sending to ring")
+            # Parse and queue the message for local processing
+            header, local_payload = parse_message(message)
+            if header:
+                self.message_queue.put((header, local_payload, self.my_address))
+        
         self.send_message_raw(message, self.next_node_address)
 
     def send_message_raw(self, message_bytes, address):
         # This is a low-level send, logging for forwarded messages can be done here if needed,
         # but currently handled by the caller (_listen) or send_message.
         # self._log("DEBUG", f"Raw send to {address}: {message_bytes.hex()}") # Potentially too verbose
-        self.sock.sendto(message_bytes, address)
+        try:
+            self.sock.sendto(message_bytes, address)
+            self._log("DEBUG", f"Successfully sent {len(message_bytes)} bytes to {address}")
+        except socket.error as e:
+            self._log("ERROR", f"Failed to send message to {address}: {e}")
+            # Check if it's a network unreachable error
+            if "Network is unreachable" in str(e) or "No route to host" in str(e):
+                self._log("ERROR", f"Network connectivity issue: Cannot reach {address[0]}:{address[1]}")
+                self._log("ERROR", "Please check: 1) IP addresses are correct, 2) Network connectivity, 3) Firewall settings")
+        except Exception as e:
+            self._log("ERROR", f"Unexpected error sending to {address}: {e}")
 
     def stop(self):
         self.running = False
