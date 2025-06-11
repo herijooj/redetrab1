@@ -23,8 +23,8 @@ GAME_END_SCORE = 100
 SHOOT_MOON_POINTS = 26
 
 # Timeout Constants
-INPUT_TIMEOUT = 30  # 30 seconds for user input
-TOKEN_TIMEOUT = 60  # 60 seconds to detect stuck tokens
+INPUT_TIMEOUT = 15  # 30 seconds for user input
+TOKEN_TIMEOUT = 30  # 60 seconds to detect stuck tokens
 GAME_TIMEOUT = 300  # 5 minutes maximum per hand
 
 # UI Constants
@@ -263,6 +263,9 @@ class HeartsGame:
         
         identifier = "Dealer" if self.is_dealer else self.player_id
         self.output_message(f"Passed token to Player {target_player}", level="DEBUG", source_id=identifier)
+        
+        # Add delay after token passing for network reliability
+        time.sleep(0.2)
 
     # ============================================================================
     # GAME INITIALIZATION METHODS (DEALER ONLY)
@@ -282,9 +285,11 @@ class HeartsGame:
             protocol.GAME_START, self.player_id, protocol.BROADCAST_ID, self.get_next_seq()
         )
         
-        time.sleep(0.5)
+        # Increased delay for game start message propagation
+        time.sleep(1.0)
         self.deal_cards()
-        time.sleep(1)
+        # Increased delay after dealing cards
+        time.sleep(1.5)
         self.start_passing_phase()
 
     def deal_cards(self):
@@ -345,7 +350,8 @@ class HeartsGame:
             self.get_next_seq(), payload
         )
         
-        time.sleep(0.5)
+        # Increased delay for phase transition
+        time.sleep(1.0)
         self.initiate_card_passing()
 
     def initiate_card_passing(self):
@@ -362,6 +368,8 @@ class HeartsGame:
             return
         
         self.display_hand()
+        # Add delay before getting cards from user for UI stability
+        time.sleep(0.3)
         self._get_cards_to_pass_from_user()
 
     def _get_cards_to_pass_from_user(self):
@@ -457,6 +465,9 @@ class HeartsGame:
             self.get_next_seq(), bytes(self.cards_to_pass)
         )
         
+        # Add delay after sending cards for network reliability
+        time.sleep(0.5)
+        
         # Log the card passing event
         try:
             passed_cards = [self._format_card_display(c) for c in self.cards_to_pass]
@@ -468,6 +479,9 @@ class HeartsGame:
         
         self.output_message(f"Passed 3 cards to Player {target_id}", level="INFO")
         self.cards_passed = True
+        
+        # Add delay before token passing
+        time.sleep(0.3)
         self.pass_token_to_player((self.player_id + 1) % 4)
 
     # ============================================================================
@@ -492,7 +506,8 @@ class HeartsGame:
             self.get_next_seq(), bytes([protocol.PHASE_TRICKS])
         )
         
-        time.sleep(0.5)
+        # Increased delay for phase transition
+        time.sleep(0.8)
         
         # Find who has 2 of clubs and give them the token
         two_clubs = protocol.encode_card("2", "CLUBS")
@@ -501,9 +516,13 @@ class HeartsGame:
             self.two_clubs_holder = self.player_id
             self.log_game_event("TOKEN_PASS", f"Dealer has 2♣, keeping token to start first trick")
             self.has_token = True
+            # Add delay before starting card play
+            time.sleep(0.3)
             self.initiate_card_play()
         else:
             self.output_message("2♣ not in hand - checking others...", level="DEBUG", source_id="Dealer")
+            # Add delay before token passing
+            time.sleep(0.3)
             self.pass_token_to_player(1)
 
     def initiate_card_play(self):
@@ -807,6 +826,9 @@ class HeartsGame:
             self.get_next_seq(), bytes([card_byte])
         )
         
+        # Add delay after playing card for network reliability
+        time.sleep(0.3)
+        
         value, suit = protocol.decode_card(card_byte)
         card_display = self._format_card_display(card_byte)
         self.output_message(f"Played {card_display}", level="INFO")
@@ -914,6 +936,9 @@ class HeartsGame:
             protocol.TRICK_SUMMARY, self.player_id, protocol.BROADCAST_ID, 
             self.get_next_seq(), bytes(payload_data)
         )
+        
+        # Add delay after trick summary for network reliability
+        time.sleep(0.4)
 
     def calculate_hand_summary(self):
         """Calculate and send hand summary with scores (dealer only)."""
@@ -1111,6 +1136,8 @@ class HeartsGame:
         self.passing_complete = False
         self.cards_passed = False
         self.has_token = True
+        # CRITICAL FIX: Reset played card flag for new hand
+        self.played_card_this_trick = False
         
         # Cycle through pass directions
         pass_directions = [protocol.PASS_LEFT, protocol.PASS_RIGHT, protocol.PASS_ACROSS, protocol.PASS_NONE]
@@ -1159,6 +1186,8 @@ class HeartsGame:
         # Reset hand state
         self.is_first_trick = True
         self.hearts_broken = False
+        # CRITICAL FIX: Reset the played card flag for new hand
+        self.played_card_this_trick = False
         if hasattr(self, '_hearts_broken_announced'):
             del self._hearts_broken_announced
         self.current_trick = []
@@ -1290,6 +1319,7 @@ class HeartsGame:
             except:
                 self.output_message(f"  Player {player_id}: [card decode error]", level="DEBUG", timestamp=False)
         
+        # CRITICAL: Reset trick state for the next trick
         self.current_trick = []
         self.is_first_trick = False
         # CRITICAL RESET: Allow player to play card in the next trick
